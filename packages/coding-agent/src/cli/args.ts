@@ -24,6 +24,8 @@ export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	/** Create or reuse an isolated git worktree; `true` requests a generated name. */
+	worktree?: string | true;
 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
 	addDir?: string[];
 	profile?: string;

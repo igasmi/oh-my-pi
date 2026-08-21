@@ -29,6 +29,7 @@ import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
+import { applyStartupWorktree, type StartupWorktree } from "./cli/startup-worktree";
 import { getLatestRelease } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
@@ -910,6 +911,7 @@ export async function buildSessionOptions(
 	sessionManager: SessionManager | undefined,
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
+	exitProcess: (code: number) => never | Promise<never> = process.exit,
 ): Promise<CreateAgentSessionOptions> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
@@ -995,7 +997,7 @@ export async function buildSessionOptions(
 				options.modelPattern = parsed.model;
 			} else {
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
-				process.exit(1);
+				await exitProcess(1);
 			}
 		} else if (resolved.model) {
 			options.model = resolved.model;
@@ -1208,6 +1210,8 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	applyStartupWorktree?: typeof applyStartupWorktree;
+	exitProcess?: (code: number) => never;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -1248,9 +1252,57 @@ export async function runRootCommand(
 		process.exit(0);
 	}
 
+	// Keep one idempotent owner for every post-acquisition completion path.
+	// process.exit() does not await finally blocks, so explicit exits drain it first.
+	let startupWorktree: StartupWorktree | null = null;
+	const releaseStartupWorktree = async (): Promise<void> => {
+		const worktree = startupWorktree;
+		startupWorktree = null;
+		await worktree?.release();
+	};
+	await using _startupWorktreeGuard = {
+		async [Symbol.asyncDispose](): Promise<void> {
+			await releaseStartupWorktree();
+		},
+	};
+	const exitAfterStartup = async (code: number): Promise<never> => {
+		await releaseStartupWorktree();
+		return (deps.exitProcess ?? process.exit)(code);
+	};
+
+	let preloadedSettings: Settings | undefined;
+	if (parsedArgs.worktree !== undefined) {
+		try {
+			// Worktree placement is configurable, so load the launch project's
+			// settings before choosing the managed path. Re-scope the same instance
+			// after checkout so every later project setting comes from the worktree.
+			preloadedSettings =
+				deps.settings ??
+				(await logger.time("settings:init", Settings.init, {
+					cwd: getProjectDir(),
+					configFiles: parsedArgs.config,
+				}));
+			startupWorktree = await logger.time(
+				"applyStartupWorktree",
+				deps.applyStartupWorktree ?? applyStartupWorktree,
+				parsedArgs,
+			);
+			if (startupWorktree) {
+				await preloadedSettings.reloadForCwd(startupWorktree.path);
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+			stopStartupWatchdog();
+			stopThemeWatcher();
+			process.exitCode = 1;
+			return;
+		}
+	}
+
 	if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
 		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
-		process.exit(1);
+		return await exitAfterStartup(1);
 	}
 	const mode = parsedArgs.mode || "text";
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
@@ -1305,11 +1357,13 @@ export async function runRootCommand(
 		const message = await describeAuthBrokerStartupError(error);
 		if (message === null) throw error;
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-		process.exit(1);
+		return await exitAfterStartup(1);
 	}
 
 	const settingsInstance =
-		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
+		preloadedSettings ??
+		deps.settings ??
+		(await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
 	if (parsedArgs.approvalMode) {
 		// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 		// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1418,7 +1472,7 @@ export async function runRootCommand(
 			if (foreignSessions.length === 0) {
 				writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} sessions found`)}\n`);
 				stopStartupWatchdog();
-				process.exit(0);
+				return await exitAfterStartup(0);
 			}
 			const choices = foreignSessions.map(foreignSessionInfoToSessionInfo);
 			pauseStartupWatchdog();
@@ -1438,7 +1492,7 @@ export async function runRootCommand(
 			if (!selected) {
 				writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} session selected`)}\n`);
 				stopStartupWatchdog();
-				process.exit(0);
+				return await exitAfterStartup(0);
 			}
 			const foreignSession = foreignSessions.find(
 				session => session.id === selected.id && session.path === selected.path,
@@ -1473,7 +1527,7 @@ export async function runRootCommand(
 			if (error.hint) {
 				process.stderr.write(`${chalk.dim(error.hint)}\n`);
 			}
-			process.exit(1);
+			return await exitAfterStartup(1);
 		}
 		throw error;
 	}
@@ -1497,7 +1551,7 @@ export async function runRootCommand(
 	if (typeof parsedArgs.resume === "string" && !sessionManager) {
 		writeStartupNotice(parsedArgs, `${chalk.dim("Resume cancelled: session was not moved.")}\n`);
 		stopStartupWatchdog();
-		process.exit(0);
+		return await exitAfterStartup(0);
 	}
 
 	// Handle --resume (no value): show session picker
@@ -1514,7 +1568,7 @@ export async function runRootCommand(
 			if (preloadedAllSessions.length === 0) {
 				writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
 				stopStartupWatchdog();
-				process.exit(0);
+				return await exitAfterStartup(0);
 			}
 		}
 		pauseStartupWatchdog();
@@ -1532,7 +1586,7 @@ export async function runRootCommand(
 			// in-session `/resume` picker (selector-controller.ts) takes a different
 			// onCancel that just closes the overlay — only this startup path exits.
 			stopStartupWatchdog();
-			process.exit(0);
+			return await exitAfterStartup(0);
 		}
 		// Re-scope every cwd-derived input before building the resumed session.
 		const previousCwd = cwd;
@@ -1578,6 +1632,7 @@ export async function runRootCommand(
 		sessionManager,
 		modelRegistry,
 		settingsInstance,
+		exitAfterStartup,
 	);
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
@@ -1599,7 +1654,7 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.red("--api-key requires a model to be specified via --model, --provider/--model, or --models")}\n`,
 			);
-			process.exit(1);
+			return await exitAfterStartup(1);
 		}
 		if (sessionOptions.model) {
 			authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsedArgs.apiKey);
@@ -1674,7 +1729,7 @@ export async function runRootCommand(
 		// tool calls (issue #2459). Exit code 2 matches the conventional
 		// "command line usage error" convention.
 		if (reportUnrecognizedFlags(initialArgs)) {
-			process.exit(2);
+			return await exitAfterStartup(2);
 		}
 		const processedFiles =
 			initialArgs.fileArgs.length > 0
@@ -1769,7 +1824,7 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-			process.exit(1);
+			return await exitAfterStartup(1);
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
@@ -1795,7 +1850,7 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 				if (logger.shouldExitAfterTimings()) {
-					process.exit(0);
+					return await exitAfterStartup(0);
 				}
 			}
 
@@ -1836,6 +1891,7 @@ export async function runRootCommand(
 			}
 			await session.dispose();
 			stopThemeWatcher();
+			await releaseStartupWorktree();
 			await postmortem.quit(0);
 		}
 	}
