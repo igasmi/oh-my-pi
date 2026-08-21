@@ -579,9 +579,9 @@ function resolveWorktreeBase(value: string | undefined): string | undefined {
 let worktreesDirOverride: string | undefined;
 
 /**
- * Relocate the base directory for agent-managed worktrees (PR checkouts, task
- * isolation, and `omp worktree` cleanup all read the same base). Driven by the
- * `worktree.base` setting in coding-agent; pass `undefined`/empty to clear and
+ * Relocate the base directory for agent-managed worktrees (CLI sessions, PR
+ * checkouts, task isolation, and `omp worktree` cleanup all read the same
+ * base). Driven by the `worktree.base` setting in coding-agent; pass `undefined`/empty to clear and
  * fall back to `OMP_WORKTREE_DIR` or the `~/.omp/wt` default.
  *
  * `~` is expanded and a relative path is rejected (see {@link resolveWorktreeBase}).
@@ -648,7 +648,7 @@ export function getAutoQaDbPath(): string {
  * Stable 7-character hex digest of an absolute filesystem path.
  *
  * Used to pack the project identity into a single short fs-safe segment
- * (e.g. PR-checkout and task-isolation worktree dirs under `~/.omp/wt/`).
+ * (e.g. session, PR-checkout, and task-isolation dirs under `~/.omp/wt/`).
  * Bun.hash is non-cryptographic — collision space is ~2^28, which is fine
  * for naming a handful of repos on a single machine. Same input on the
  * same Bun runtime yields the same output.
