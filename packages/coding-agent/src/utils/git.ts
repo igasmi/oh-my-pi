@@ -157,6 +157,8 @@ export interface GitWorktreeEntry {
 	branch?: string;
 	detached: boolean;
 	head?: string;
+	/** Present when git has locked the worktree; empty string means no reason was recorded. */
+	locked?: string;
 	path: string;
 }
 
@@ -618,7 +620,8 @@ const repoWriteChain = new Map<string, Promise<unknown>>();
  * module never auto-acquire — callers wrap the critical section themselves.
  */
 export async function withRepoLock<T>(cwd: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-	const key = (await repo.primaryRoot(cwd, signal)) ?? cwd;
+	const primaryRoot = (await repo.primaryRoot(cwd, signal)) ?? cwd;
+	const key = await fs.promises.realpath(primaryRoot).catch(() => path.resolve(primaryRoot));
 	const prior = repoWriteChain.get(key);
 	const run = (async () => {
 		if (prior) {
@@ -1152,33 +1155,41 @@ function parseDefaultBranchRef(refPath: string, target: string | null): string |
 	if (!target?.startsWith(HEAD_REF_PREFIX)) return null;
 	const resolvedRef = target.slice(HEAD_REF_PREFIX.length).trim();
 	const remotePrefix = refPath.slice(0, -"HEAD".length);
-	if (!resolvedRef.startsWith(remotePrefix)) return null;
-	return resolvedRef.slice(remotePrefix.length) || null;
+	if (!resolvedRef.startsWith(remotePrefix) || resolvedRef.length === remotePrefix.length) return null;
+	return resolvedRef;
 }
 
 function stripRemotePrefix(refValue: string): string | null {
-	const slash = refValue.indexOf("/");
-	if (slash < 0) return refValue || null;
-	return refValue.slice(slash + 1) || null;
+	const remoteRef = refValue.startsWith("refs/remotes/") ? refValue.slice("refs/remotes/".length) : refValue;
+	const slash = remoteRef.indexOf("/");
+	if (slash < 0) return remoteRef || null;
+	return remoteRef.slice(slash + 1) || null;
 }
 
 function parseWorktreeList(text: string): GitWorktreeEntry[] {
-	const trimmed = text.trim();
-	if (!trimmed) return [];
-	return trimmed
-		.split(/\n\s*\n/)
-		.map(block => block.trim())
-		.filter(Boolean)
-		.map(block => {
-			const entry: GitWorktreeEntry = { detached: false, path: "" };
-			for (const line of block.split("\n")) {
-				if (line.startsWith("worktree ")) entry.path = line.slice("worktree ".length);
-				else if (line.startsWith("HEAD ")) entry.head = line.slice("HEAD ".length);
-				else if (line.startsWith("branch ")) entry.branch = line.slice("branch ".length);
-				else if (line === "detached") entry.detached = true;
-			}
-			return entry;
-		});
+	const entries: GitWorktreeEntry[] = [];
+	let entry: GitWorktreeEntry | null = null;
+	const finishEntry = (): void => {
+		if (entry) entries.push(entry);
+		entry = null;
+	};
+
+	for (const field of text.split("\0")) {
+		if (!field) {
+			finishEntry();
+		} else if (field.startsWith("worktree ")) {
+			finishEntry();
+			entry = { detached: false, path: field.slice("worktree ".length) };
+		} else if (entry) {
+			if (field.startsWith("HEAD ")) entry.head = field.slice("HEAD ".length);
+			else if (field.startsWith("branch ")) entry.branch = field.slice("branch ".length);
+			else if (field === "detached") entry.detached = true;
+			else if (field === "locked") entry.locked = "";
+			else if (field.startsWith("locked ")) entry.locked = field.slice("locked ".length);
+		}
+	}
+	finishEntry();
+	return entries;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1793,28 +1804,40 @@ export const branch = {
 		return result.stdout.trim() || null;
 	},
 
-	/** Default branch name (from remote HEAD refs). */
-	async default(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	/** Exact cached remote default ref, preserving origin/upstream identity. */
+	async defaultRef(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const repository = await resolveRepository(cwd);
 		if (repository) {
 			for (const refPath of DEFAULT_BRANCH_REFS) {
-				const target = await readRef(repository, refPath, signal);
-				const branchName = parseDefaultBranchRef(refPath, target);
-				if (branchName) return branchName;
+				const defaultRef = parseDefaultBranchRef(refPath, await readRef(repository, refPath, signal));
+				if (defaultRef) return defaultRef;
 			}
 		}
-		for (const remoteRef of ["origin/HEAD", "upstream/HEAD"]) {
-			const result = await git(cwd, ["rev-parse", "--abbrev-ref", remoteRef], { readOnly: true, signal });
+		for (const refPath of DEFAULT_BRANCH_REFS) {
+			const remoteRef = refPath.slice("refs/remotes/".length);
+			const result = await git(cwd, ["rev-parse", "--symbolic-full-name", remoteRef], { readOnly: true, signal });
 			if (result.exitCode !== 0) continue;
-			const branchName = stripRemotePrefix(result.stdout.trim());
-			if (branchName) return branchName;
+			const defaultRef = parseDefaultBranchRef(refPath, `${HEAD_REF_PREFIX} ${result.stdout}`);
+			if (defaultRef) return defaultRef;
 		}
 		return null;
+	},
+
+	/** Default branch name (from remote HEAD refs). */
+	async default(cwd: string, signal?: AbortSignal): Promise<string | null> {
+		const defaultRef = await branch.defaultRef(cwd, signal);
+		return defaultRef ? stripRemotePrefix(defaultRef) : null;
 	},
 
 	/** Create a new branch at the given start point. */
 	async create(cwd: string, name: string, startPoint = "HEAD", signal?: AbortSignal): Promise<void> {
 		await runEffect(cwd, ["branch", name, startPoint], { signal });
+	},
+
+	/** Whether `name` is accepted by git as a local branch name. */
+	async isValidName(cwd: string, name: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["check-ref-format", "--branch", name], { readOnly: true, signal });
+		return result.exitCode === 0;
 	},
 
 	/** Force-move a branch to a new start point. */
@@ -1911,6 +1934,12 @@ export const ref = {
 		return result.stdout.trim() || null;
 	},
 
+	/** Atomically delete a ref only while it still points at `expectedOid`. */
+	async tryDelete(cwd: string, refName: string, expectedOid: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["update-ref", "-d", refName, expectedOid], { signal });
+		return result.exitCode === 0;
+	},
+
 	/** Tags pointing at a ref. */
 	async tags(cwd: string, refName = "HEAD", signal?: AbortSignal): Promise<string[]> {
 		return splitLines(
@@ -1961,10 +1990,11 @@ export const worktree = {
 		cwd: string,
 		worktreePath: string,
 		refName: string,
-		options: { detach?: boolean; signal?: AbortSignal } = {},
+		options: { detach?: boolean; lockReason?: string; signal?: AbortSignal } = {},
 	): Promise<void> {
 		const args = ["worktree", "add"];
 		if (options.detach) args.push("--detach");
+		if (options.lockReason !== undefined) args.push("--lock", "--reason", options.lockReason);
 		args.push(worktreePath, refName);
 		await runEffect(cwd, args, { signal: options.signal });
 	},
@@ -1993,7 +2023,22 @@ export const worktree = {
 	},
 
 	async list(cwd: string, signal?: AbortSignal): Promise<GitWorktreeEntry[]> {
-		return parseWorktreeList(await runText(cwd, ["worktree", "list", "--porcelain"], { readOnly: true, signal }));
+		return parseWorktreeList(
+			await runText(cwd, ["worktree", "list", "--porcelain", "-z"], { readOnly: true, signal }),
+		);
+	},
+
+	async lock(cwd: string, worktreePath: string, reason: string, signal?: AbortSignal): Promise<void> {
+		await runEffect(cwd, ["worktree", "lock", "--reason", reason, worktreePath], { signal });
+	},
+
+	async unlock(cwd: string, worktreePath: string, signal?: AbortSignal): Promise<void> {
+		await runEffect(cwd, ["worktree", "unlock", worktreePath], { signal });
+	},
+
+	async tryUnlock(cwd: string, worktreePath: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["worktree", "unlock", worktreePath], { signal });
+		return result.exitCode === 0;
 	},
 
 	async prune(cwd: string, signal?: AbortSignal): Promise<void> {
@@ -2430,6 +2475,19 @@ export const repo = {
 	/** Full GitRepository metadata. */
 	resolve(cwd: string): Promise<GitRepository | null> {
 		return resolveRepository(cwd);
+	},
+
+	/** Verify that a linked worktree's admin directory points back to its own `.git` file. */
+	async hasValidLinkedWorktreeBacklink(repository: GitRepository): Promise<boolean> {
+		if (!(await isLinkedWorktreeAsync(repository))) return false;
+		const backlink = (await readOptionalText(path.join(repository.gitDir, "gitdir")))?.trim();
+		if (!backlink) return false;
+		const backlinkPath = path.resolve(repository.gitDir, backlink);
+		const [canonicalBacklink, canonicalGitEntry] = await Promise.all([
+			fs.promises.realpath(backlinkPath).catch(() => null),
+			fs.promises.realpath(repository.gitEntryPath).catch(() => null),
+		]);
+		return canonicalBacklink !== null && canonicalBacklink === canonicalGitEntry;
 	},
 
 	/** Check if the repository uses the reftable reference storage format (sync). */

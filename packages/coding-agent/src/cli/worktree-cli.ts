@@ -3,15 +3,16 @@
  *
  * Layout under `~/.omp/wt/`:
  *
- *   - **PR-checkout worktrees** (`tools/gh.ts`): a regular git worktree dir
- *     containing a `.git` *file* that points back at
- *     `<parent-repo>/.git/worktrees/<name>/`.
+ *   - **Session worktrees** (`omp --worktree` / `-w`): regular linked git
+ *     worktrees on `worktree-*` branches.
+ *   - **PR-checkout worktrees** (`tools/gh.ts`): regular linked git worktrees
+ *     on `pr-*` branches.
  *   - **Task-isolation dirs** (`task/worktree.ts`): a wrapper dir with a
  *     compact `m` subdir mounted/cloned by `natives.isoStart`. Legacy `merged`
  *     subdirs are still recognized. `ensureIsolation` writes an ownership
- *     marker naming the live omp process; a
- *     sandbox whose owner is still running is reported `live` and never
- *     removed without `--all`, so `clear` reclaims only crashed leftovers.
+ *     marker naming the live omp process; a sandbox whose owner is still
+ *     running is reported `live` and never removed without `--all`, so `clear`
+ *     reclaims only crashed leftovers.
  *
  * Legacy entries from before the encoding change keep working because git still
  * tracks them by branch name. This command exists to GC them on demand.
@@ -23,9 +24,19 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE } from "../task/isolation-ownership";
 import * as git from "../utils/git";
 
-type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
+type WorktreeKind = "pr-checkout" | "session" | "task-isolation" | "empty" | "stray";
 
 const TASK_ISOLATION_MOUNT_DIRS = ["m", "merged"] as const;
+
+interface ManagedRoot {
+	path: string;
+	canonicalPath: string;
+}
+
+interface WorktreeScan {
+	entries: WorktreeEntry[];
+	root: ManagedRoot | null;
+}
 
 export interface WorktreeEntry {
 	/** Absolute path to the worktree dir (or stray container) under `~/.omp/wt/`. */
@@ -53,7 +64,7 @@ export interface ClearWorktreesOptions {
 }
 
 export async function listWorktrees(options: ListWorktreesOptions): Promise<void> {
-	const entries = await scanWorktrees();
+	const { entries } = await scanWorktrees();
 	if (options.json) {
 		console.log(JSON.stringify(entries, null, 2));
 		return;
@@ -76,7 +87,7 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
 }
 
 export async function clearWorktrees(options: ClearWorktreesOptions): Promise<void> {
-	const entries = await scanWorktrees();
+	const { entries, root } = await scanWorktrees();
 	const targets = options.all ? entries : entries.filter(entry => entry.orphanReason !== undefined);
 
 	if (targets.length === 0) {
@@ -102,18 +113,28 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 
 	const results: { path: string; ok: boolean; error?: string }[] = [];
 	const parentsToPrune = new Set<string>();
+	if (!root) throw new Error("Managed worktree root disappeared before removal.");
 	for (const target of targets) {
 		try {
-			if (target.kind === "pr-checkout" && target.parentRepo && !target.orphanReason) {
-				// Live worktree: ask git to remove it cleanly. If git refuses (locked,
-				// dirty, etc.), fall back to fs.rm and rely on `worktree prune` to
-				// clean the bookkeeping on the parent side.
+			if (
+				(target.kind === "pr-checkout" || target.kind === "session") &&
+				target.parentRepo &&
+				!target.orphanReason
+			) {
+				// This branch is reachable only for explicit `--all`. Release a git
+				// lock first so removal also clears its metadata; pruning deliberately
+				// preserves locked entries. An unlocked worktree simply returns false.
+				await assertSafeManagedDirectory(root, target.path);
+				await git.worktree.tryUnlock(target.parentRepo, target.path);
+				await assertSafeManagedDirectory(root, target.path);
 				const removed = await git.worktree.tryRemove(target.parentRepo, target.path, { force: true });
 				if (!removed) {
+					await assertSafeManagedDirectory(root, target.path);
 					await fs.rm(target.path, { recursive: true, force: true });
 					parentsToPrune.add(target.parentRepo);
 				}
 			} else {
+				await assertSafeManagedDirectory(root, target.path);
 				await fs.rm(target.path, { recursive: true, force: true });
 				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
 			}
@@ -157,25 +178,27 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 // Scanner
 // ───────────────────────────────────────────────────────────────────────────
 
-async function scanWorktrees(): Promise<WorktreeEntry[]> {
-	const root = getWorktreesDir();
+async function scanWorktrees(): Promise<WorktreeScan> {
+	const rootPath = path.resolve(getWorktreesDir());
+	let canonicalRoot: string;
 	let topLevel: string[];
 	try {
-		topLevel = await fs.readdir(root);
+		canonicalRoot = await fs.realpath(rootPath);
+		topLevel = await fs.readdir(rootPath);
 	} catch (err) {
-		if (isEnoent(err)) return [];
+		if (isEnoent(err)) return { entries: [], root: null };
 		throw err;
 	}
+	const root = { path: rootPath, canonicalPath: canonicalRoot };
 
 	const entries: WorktreeEntry[] = [];
 	for (const name of topLevel) {
-		const dir = path.join(root, name);
-		const stat = await fs.stat(dir).catch(() => null);
-		if (!stat?.isDirectory()) continue;
+		const dir = path.join(root.path, name);
+		if (!(await isSafeManagedDirectory(root, dir))) continue;
 
 		const direct = await classifyDir(dir);
 		if (direct) {
-			entries.push(direct);
+			if (await isSafeManagedDirectory(root, dir)) entries.push(direct);
 			continue;
 		}
 
@@ -189,15 +212,14 @@ async function scanWorktrees(): Promise<WorktreeEntry[]> {
 		let nested = 0;
 		for (const child of children) {
 			const childDir = path.join(dir, child);
-			const childStat = await fs.stat(childDir).catch(() => null);
-			if (!childStat?.isDirectory()) continue;
+			if (!(await isSafeManagedDirectory(root, childDir))) continue;
 			const childClassified = await classifyDir(childDir);
-			if (childClassified) {
+			if (childClassified && (await isSafeManagedDirectory(root, childDir))) {
 				entries.push(childClassified);
 				nested += 1;
 			}
 		}
-		if (nested === 0) {
+		if (nested === 0 && (await isSafeManagedDirectory(root, dir))) {
 			entries.push({
 				path: dir,
 				kind: children.length === 0 ? "empty" : "stray",
@@ -205,25 +227,53 @@ async function scanWorktrees(): Promise<WorktreeEntry[]> {
 			});
 		}
 	}
-	return entries;
+	return { entries, root };
+}
+
+function isStrictDescendant(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+async function isSafeManagedDirectory(root: ManagedRoot, candidate: string): Promise<boolean> {
+	const absoluteCandidate = path.resolve(candidate);
+	if (!isStrictDescendant(root.path, absoluteCandidate)) return false;
+
+	const relative = path.relative(root.path, absoluteCandidate);
+	let current = root.path;
+	for (const segment of relative.split(path.sep)) {
+		current = path.join(current, segment);
+		const stat = await fs.lstat(current).catch(() => null);
+		if (!stat?.isDirectory() || stat.isSymbolicLink()) return false;
+	}
+
+	const canonicalCandidate = await fs.realpath(absoluteCandidate).catch(() => null);
+	return canonicalCandidate !== null && isStrictDescendant(root.canonicalPath, canonicalCandidate);
+}
+
+async function assertSafeManagedDirectory(root: ManagedRoot, candidate: string): Promise<void> {
+	if (!(await isSafeManagedDirectory(root, candidate))) {
+		throw new Error("Refusing to remove a path outside the managed worktree root or through a symbolic link.");
+	}
 }
 
 async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
 	const gitEntry = path.join(dir, ".git");
-	const gitStat = await fs.stat(gitEntry).catch(() => null);
-	if (gitStat?.isFile()) {
-		return classifyPrCheckout(dir, gitEntry);
+	const gitStat = await fs.lstat(gitEntry).catch(() => null);
+	if (gitStat?.isFile() && !gitStat.isSymbolicLink()) {
+		return classifyGitWorktree(dir, gitEntry);
 	}
 	// A task-isolation sandbox is identified by its ownership marker — written
 	// before the backend materialises the mount — or by the `m`/`merged` mount
 	// dir itself (legacy dirs and crashed pre-marker runs). Recognizing the
 	// marker alone keeps an in-progress sandbox from being mistaken for a stray
 	// during the window between marker creation and mount materialisation.
-	let isIsolation = await Bun.file(path.join(dir, ISOLATION_OWNER_FILE)).exists();
+	const ownerStat = await fs.lstat(path.join(dir, ISOLATION_OWNER_FILE)).catch(() => null);
+	let isIsolation = ownerStat?.isFile() === true && !ownerStat.isSymbolicLink();
 	if (!isIsolation) {
 		for (const mountDir of TASK_ISOLATION_MOUNT_DIRS) {
-			const mountStat = await fs.stat(path.join(dir, mountDir)).catch(() => null);
-			if (mountStat?.isDirectory()) {
+			const mountStat = await fs.lstat(path.join(dir, mountDir)).catch(() => null);
+			if (mountStat?.isDirectory() && !mountStat.isSymbolicLink()) {
 				isIsolation = true;
 				break;
 			}
@@ -240,7 +290,7 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
 	};
 }
 
-async function classifyPrCheckout(dir: string, gitEntry: string): Promise<WorktreeEntry> {
+async function classifyGitWorktree(dir: string, gitEntry: string): Promise<WorktreeEntry> {
 	let contents: string;
 	try {
 		contents = await fs.readFile(gitEntry, "utf8");
@@ -252,19 +302,27 @@ async function classifyPrCheckout(dir: string, gitEntry: string): Promise<Worktr
 		};
 	}
 	const match = /^gitdir:\s*(.+?)\s*$/m.exec(contents);
-	const parentGitDir = match?.[1];
-	if (!parentGitDir) {
+	const gitDirPointer = match?.[1];
+	if (!gitDirPointer) {
 		return { path: dir, kind: "pr-checkout", orphanReason: "malformed .git file (no gitdir line)" };
 	}
-	// parentGitDir is `<parent-repo>/.git/worktrees/<name>`; back out the repo root.
-	const parentRepo = path.dirname(path.dirname(path.dirname(parentGitDir)));
-	const branch = await readWorktreeBranch(path.join(parentGitDir, "HEAD"));
+	const resolvedGitDir = path.resolve(path.dirname(gitEntry), gitDirPointer);
+	const resolvedRepository = await git.repo.resolve(dir);
+	const repository =
+		resolvedRepository && path.resolve(resolvedRepository.gitEntryPath) === path.resolve(gitEntry)
+			? resolvedRepository
+			: null;
+	const primaryRoot = repository ? await git.repo.primaryRoot(dir) : null;
+	const headFile = repository?.headPath ?? path.join(resolvedGitDir, "HEAD");
+	const branch = await readWorktreeBranch(headFile);
+	const kind: WorktreeKind = branch?.startsWith("worktree-") ? "session" : "pr-checkout";
+	const fallbackParentRepo = path.dirname(path.dirname(path.dirname(resolvedGitDir)));
+	const parentRepo = primaryRoot ?? fallbackParentRepo;
 
-	const parentDirStat = await fs.stat(parentGitDir).catch(() => null);
-	if (!parentDirStat?.isDirectory()) {
+	if (!repository) {
 		return {
 			path: dir,
-			kind: "pr-checkout",
+			kind,
 			parentRepo,
 			branch,
 			orphanReason: "parent repo no longer tracks this worktree",
@@ -274,13 +332,13 @@ async function classifyPrCheckout(dir: string, gitEntry: string): Promise<Worktr
 	if (!parentRepoStat?.isDirectory()) {
 		return {
 			path: dir,
-			kind: "pr-checkout",
+			kind,
 			parentRepo,
 			branch,
 			orphanReason: "parent repo missing",
 		};
 	}
-	return { path: dir, kind: "pr-checkout", parentRepo, branch };
+	return { path: dir, kind, parentRepo, branch };
 }
 
 async function readWorktreeBranch(headFile: string): Promise<string | undefined> {
@@ -299,6 +357,10 @@ function formatEntryDetail(entry: WorktreeEntry): string {
 		const repo = entry.parentRepo ? path.basename(entry.parentRepo) : "unknown repo";
 		const branch = entry.branch ?? "unknown branch";
 		parts.push(`${repo} · ${branch}`);
+	} else if (entry.kind === "session") {
+		const repo = entry.parentRepo ? path.basename(entry.parentRepo) : "unknown repo";
+		const branch = entry.branch ?? "unknown branch";
+		parts.push(`${repo} · ${branch} · isolated session`);
 	} else if (entry.kind === "task-isolation") {
 		parts.push("task-isolation sandbox");
 	} else if (entry.kind === "empty") {
