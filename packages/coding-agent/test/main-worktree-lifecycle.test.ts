@@ -25,6 +25,13 @@ function createTrackedWorktree(releaseGate: Promise<void> = Promise.resolve()): 
 			name: "lifecycle-test",
 			branch: "lifecycle-test",
 			path: path.join(process.cwd(), ".lifecycle-test-worktree"),
+			isolation: {
+				worktreeRoot: "/synthetic/lifecycle-test-worktree",
+				primaryRoot: "/synthetic/primary-checkout",
+				name: "lifecycle-test",
+				branch: "lifecycle-test",
+				commonDir: "/synthetic/repository/.git",
+			},
 			reused: false,
 			async release() {
 				state.releaseCalls++;

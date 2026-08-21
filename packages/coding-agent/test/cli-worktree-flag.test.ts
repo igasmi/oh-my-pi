@@ -32,14 +32,17 @@ describe("--worktree launch flag", () => {
 	test("bare forms request a generated name when followed by another flag or end of argv", () => {
 		const long = parseArgs(["--worktree", "--print", "prompt"]);
 		const short = parseArgs(["-w"]);
-		const emptyEquals = parseArgs(["--worktree="]);
 
 		expect(long.worktree).toBe(true);
 		expect(long.print).toBe(true);
 		expect(long.messages).toEqual(["prompt"]);
 		expect(short.worktree).toBe(true);
-		expect(emptyEquals.worktree).toBe(true);
-		expect(emptyEquals.messages).toEqual([]);
+	});
+
+	test("rejects explicitly empty names while preserving the genuinely bare form", () => {
+		expect(() => parseArgs(["--worktree="])).toThrow('Invalid worktree name ""');
+		expect(() => parseArgs(["-w", ""])).toThrow('Invalid worktree name ""');
+		expect(parseArgs(["-w"]).worktree).toBe(true);
 	});
 
 	test("POSIX separator lets a bare worktree flag precede a flag-shaped prompt", () => {

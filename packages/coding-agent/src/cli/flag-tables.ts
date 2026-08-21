@@ -74,6 +74,8 @@ export type OptionalSetter = (result: Args, value: string | undefined) => void;
 export interface OptionalFlagConfig {
 	set: OptionalSetter;
 	rejectEmpty?: boolean;
+	/** Treat a present empty token as an invalid value instead of the bare form. */
+	errorOnEmpty?: boolean;
 }
 
 // Shared setters for flags that alias the same field.
@@ -250,8 +252,8 @@ export const OPTIONAL_FLAGS: Record<string, OptionalFlagConfig> = {
 	"--resume": { set: setResume, rejectEmpty: true },
 	"-r": { set: setResume, rejectEmpty: true },
 	"--session": { set: setResume, rejectEmpty: true },
-	"--worktree": { set: setWorktree, rejectEmpty: true },
-	"-w": { set: setWorktree, rejectEmpty: true },
+	"--worktree": { set: setWorktree, rejectEmpty: true, errorOnEmpty: true },
+	"-w": { set: setWorktree, rejectEmpty: true, errorOnEmpty: true },
 };
 
 /**

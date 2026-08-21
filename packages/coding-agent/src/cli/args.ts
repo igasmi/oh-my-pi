@@ -221,6 +221,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
 			const config = OPTIONAL_FLAGS[arg];
 			const next = args[i + 1];
+			if (config.errorOnEmpty === true && next === "") {
+				throw new CliUsageError(`Invalid worktree name "": provide a non-empty name or omit it to generate one.`);
+			}
 			const consume =
 				next !== undefined && !next.startsWith("-") && !(config.rejectEmpty === true && next.length === 0);
 			config.set(result, consume ? args[++i] : undefined);

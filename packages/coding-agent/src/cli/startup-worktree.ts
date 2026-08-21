@@ -12,6 +12,7 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
+import { validateWorktreeIsolation, type WorktreeIsolation } from "../session/worktree-isolation";
 import { currentProcessOwner, isProcessOwnerLive, type ProcessOwner } from "../task/isolation-ownership";
 import * as git from "../utils/git";
 import type { Args } from "./args";
@@ -34,6 +35,8 @@ export interface StartupWorktree {
 	branch: string;
 	/** Absolute normalized path to the linked worktree. */
 	path: string;
+	/** Verified isolation identity persisted with sessions created in this checkout. */
+	isolation: WorktreeIsolation;
 	/** True when an existing managed worktree was reopened. */
 	reused: boolean;
 	/** Release this process's worktree lock without removing the checkout. */
@@ -160,6 +163,8 @@ interface PreparedWorktree {
 	repoRoot: string;
 	reused: boolean;
 	lockReason: string;
+	primaryRoot: string;
+	commonDir: string;
 }
 
 async function prepareWorktree(cwd: string, requestedName: string | true): Promise<PreparedWorktree> {
@@ -247,6 +252,8 @@ async function prepareWorktree(cwd: string, requestedName: string | true): Promi
 							path: worktreePath,
 							repoRoot,
 							reused: true,
+							primaryRoot: canonicalPrimaryRepoRoot,
+							commonDir: sourceCommonDir,
 							lockReason,
 						};
 					}
@@ -289,6 +296,8 @@ async function prepareWorktree(cwd: string, requestedName: string | true): Promi
 					path: worktreePath,
 					repoRoot,
 					reused: branchExisted,
+					primaryRoot: canonicalPrimaryRepoRoot,
+					commonDir: sourceCommonDir,
 					lockReason,
 				};
 			}),
@@ -321,6 +330,14 @@ function withRelease(prepared: PreparedWorktree): StartupWorktree {
 		branch: prepared.branch,
 		path: prepared.path,
 		reused: prepared.reused,
+		isolation: {
+			worktreeRoot: prepared.path,
+			primaryRoot: prepared.primaryRoot,
+			name: prepared.name,
+			branch: prepared.branch,
+			commonDir: prepared.commonDir,
+			managed: true,
+		},
 		async release() {
 			unregister();
 			await unlock();
@@ -335,6 +352,11 @@ export async function applyStartupWorktree(parsed: Args): Promise<StartupWorktre
 	const prepared = await prepareWorktree(getProjectDir(), parsed.worktree);
 	const worktree = withRelease(prepared);
 	try {
+		const validation = await validateWorktreeIsolation(worktree.isolation);
+		if (validation.status !== "valid") {
+			throw new StartupWorktreeError(`Created worktree failed isolation verification: ${validation.reason}`);
+		}
+		worktree.isolation = validation.isolation;
 		setProjectDir(worktree.path);
 		worktree.path = getProjectDir();
 		parsed.cwd = worktree.path;
