@@ -127,6 +127,20 @@ export interface FetchOptions {
 	readonly timeoutMs?: number;
 }
 
+export interface LsFilesOptions {
+	readonly excludeFile?: string;
+	readonly excludeStandard?: boolean;
+	readonly ignored?: boolean;
+	readonly others?: boolean;
+	readonly signal?: AbortSignal;
+}
+
+export interface LsIgnoredOptions {
+	readonly excludeFile?: string;
+	readonly excludeStandard?: boolean;
+	readonly signal?: AbortSignal;
+}
+
 export interface CloneOptions {
 	readonly ref?: string;
 	readonly sha?: string;
@@ -152,6 +166,11 @@ export interface GitDetachedHead extends GitHeadBase {
 }
 
 export type GitHeadState = GitRefHead | GitDetachedHead;
+
+export interface GitRefEntry {
+	name: string;
+	oid: string;
+}
 
 export interface GitWorktreeEntry {
 	branch?: string;
@@ -1957,6 +1976,20 @@ export const ref = {
 			),
 		);
 	},
+
+	/** List fully-qualified refs and their target object IDs. */
+	async list(cwd: string, options: { pattern?: string; signal?: AbortSignal } | string = {}): Promise<GitRefEntry[]> {
+		const pattern = typeof options === "string" ? options : options.pattern;
+		const signal = typeof options === "string" ? undefined : options.signal;
+		const args = ["for-each-ref", "--format=%(refname) %(objectname)"];
+		if (pattern) args.push(pattern);
+		const lines = splitLines(await runText(cwd, args, { readOnly: true, signal }));
+		return lines.flatMap(line => {
+			const space = line.indexOf(" ");
+			if (space === -1) return [];
+			return [{ name: line.slice(0, space), oid: line.slice(space + 1) }];
+		});
+	},
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2311,20 +2344,25 @@ export async function clean(
 // ════════════════════════════════════════════════════════════════════════════
 
 export const ls = {
-	/** List files tracked or untracked by git. */
-	async files(
-		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
-	): Promise<string[]> {
-		const args = ["ls-files"];
+	/** List files tracked or untracked by git. Paths are NUL-delimited so unusual filenames remain intact. */
+	async files(cwd: string, options: LsFilesOptions = {}): Promise<string[]> {
+		const args = ["ls-files", "-z"];
 		if (options.others) args.push("--others");
+		if (options.ignored) args.push("--ignored");
 		if (options.excludeStandard) args.push("--exclude-standard");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		if (options.excludeFile) args.push(`--exclude-from=${options.excludeFile}`);
+		const raw = await runText(cwd, args, { readOnly: true, signal: options.signal });
+		return raw.split("\0").filter(entry => entry.length > 0);
 	},
 
 	/** List untracked files (excludes ignored). */
 	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
 		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	},
+
+	/** List untracked paths selected by git's ignore matcher. */
+	async ignored(cwd: string, options: LsIgnoredOptions): Promise<string[]> {
+		return ls.files(cwd, { ...options, ignored: true, others: true });
 	},
 
 	/** List paths present in a ref, optionally filtered to specific paths. */
