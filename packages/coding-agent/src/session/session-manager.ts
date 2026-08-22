@@ -1444,6 +1444,24 @@ export class SessionManager {
 			headerCwd !== undefined && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd));
 		const nextCwd = adoptHeaderCwd ? headerCwd : this.#cwd;
 		let adoptedInheritedBinding = false;
+		if (inheritedWorktreeIsolation && header.worktreeIsolation !== undefined) {
+			// A caller-supplied parent binding must describe the SAME worktree the
+			// file is already bound to — a child file bound to a different (even
+			// valid) worktree indicates cross-session reuse; fail closed.
+			const existing = header.worktreeIsolation;
+			if (
+				normalizePathForComparison(existing.worktreeRoot) !==
+					normalizePathForComparison(inheritedWorktreeIsolation.worktreeRoot) ||
+				normalizePathForComparison(existing.primaryRoot) !==
+					normalizePathForComparison(inheritedWorktreeIsolation.primaryRoot) ||
+				existing.branch !== inheritedWorktreeIsolation.branch
+			) {
+				throw new WorktreeIsolationError(
+					"Session file is bound to a different worktree than the inherited binding.",
+					"tampered",
+				);
+			}
+		}
 		if (inheritedWorktreeIsolation && header.worktreeIsolation === undefined) {
 			if (
 				normalizePathForComparison(nextCwd) !== normalizePathForComparison(inheritedWorktreeIsolation.worktreeRoot)

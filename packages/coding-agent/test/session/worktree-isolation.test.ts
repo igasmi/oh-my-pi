@@ -290,6 +290,37 @@ describe("worktree isolation binding", () => {
 		expect(error).toBeInstanceOf(WorktreeIsolationError);
 	});
 
+	test("rejects an inherited binding that names a different worktree than the file's own binding", async () => {
+		const fixtureA = await createWorktreeFixture("omp-worktree-isolation-a-");
+		const fixtureB = await createWorktreeFixture("omp-worktree-isolation-b-");
+		const childFile = path.join(fixtureA.root, "sessions", "bound-child.jsonl");
+
+		const child = await SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+			initialCwd: fixtureA.worktreeRoot,
+			suppressBreadcrumb: true,
+			worktreeIsolation: fixtureA.isolation,
+		});
+		await child.flush();
+
+		// Reopening the A-bound file while claiming a B parent must fail closed —
+		// silently accepting it would attach the session to the wrong worktree.
+		const error = await rejectionOf(
+			SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+				worktreeIsolation: fixtureB.isolation,
+			}),
+		);
+		expect(error).toBeInstanceOf(WorktreeIsolationError);
+		expect((error as WorktreeIsolationError).code).toBe("tampered");
+
+		// The matching parent binding still opens cleanly.
+		const reopened = await SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+			worktreeIsolation: fixtureA.isolation,
+		});
+		expect(reopened.getWorktreeIsolation()?.worktreeRoot).toBe(fixtureA.isolation.worktreeRoot);
+	});
+
 	test("preserves all session manager state when newSession is called with a mismatched worktree binding", async () => {
 		const fixture = await createWorktreeFixture("omp-worktree-isolation-a-");
 		const foreign = await createWorktreeFixture("omp-worktree-isolation-b-");

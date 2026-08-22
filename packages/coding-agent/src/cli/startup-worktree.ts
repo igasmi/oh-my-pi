@@ -174,6 +174,9 @@ interface PreparedWorktree {
 	 *  a cleared worktree recreated on its surviving branch has `reused: true`
 	 *  but still needs its includes seeded. */
 	createdDirectory: boolean;
+	/** OID the branch was created at when THIS call created it; null when the
+	 *  branch pre-existed. Enables CAS rollback of the branch on setup failure. */
+	createdBranchOid: string | null;
 	lockReason: string;
 	primaryRoot: string;
 	commonDir: string;
@@ -273,6 +276,7 @@ async function prepareWorktree(cwd: string, requestedName: string | true): Promi
 								repoRoot,
 								reused: true,
 								createdDirectory: false,
+								createdBranchOid: null,
 								primaryRoot: canonicalPrimaryRepoRoot,
 								commonDir: sourceCommonDir,
 								lockReason,
@@ -318,6 +322,7 @@ async function prepareWorktree(cwd: string, requestedName: string | true): Promi
 						repoRoot,
 						reused: branchExisted,
 						createdDirectory: true,
+						createdBranchOid,
 						primaryRoot: canonicalPrimaryRepoRoot,
 						commonDir: sourceCommonDir,
 						lockReason,
@@ -334,6 +339,30 @@ async function prepareWorktree(cwd: string, requestedName: string | true): Promi
 			);
 		}
 		throw error;
+	}
+}
+
+/**
+ * Tear down a checkout this launch created so the next attempt re-runs setup
+ * (notably `.worktreeinclude` seeding) instead of silently reusing a
+ * half-initialized directory. The branch is only CAS-deleted at the OID this
+ * call created it at — a concurrently advanced branch survives.
+ */
+async function rollbackCreatedWorktree(prepared: PreparedWorktree): Promise<void> {
+	try {
+		const removed = await git.worktree.tryRemove(prepared.repoRoot, prepared.path, { force: true });
+		if (!removed) {
+			await fs.rm(prepared.path, { recursive: true, force: true });
+			await git.worktree.prune(prepared.repoRoot).catch(() => {});
+		}
+		if (prepared.createdBranchOid) {
+			await git.ref.tryDelete(prepared.repoRoot, `refs/heads/${prepared.branch}`, prepared.createdBranchOid);
+		}
+	} catch (error) {
+		logger.warn("Failed to roll back partially initialized worktree", {
+			path: prepared.path,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
@@ -399,6 +428,10 @@ export async function applyStartupWorktree(parsed: Args): Promise<StartupWorktre
 					});
 				}
 			} catch (error) {
+				// Leaving the fresh checkout behind would make the next launch reuse
+				// it with createdDirectory=false and silently skip include seeding.
+				await worktree.release();
+				await rollbackCreatedWorktree(prepared);
 				throw new StartupWorktreeError(
 					`Failed to copy .worktreeinclude entries into the worktree: ${error instanceof Error ? error.message : String(error)}`,
 				);

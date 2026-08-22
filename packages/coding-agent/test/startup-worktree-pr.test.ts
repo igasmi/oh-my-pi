@@ -187,3 +187,80 @@ describe("-w pull request selector integration", () => {
 		}
 	});
 });
+
+describe("-w .worktreeinclude lifecycle", () => {
+	async function withWorktreeGlobals<T>(repo: string, managed: string, run: () => Promise<T>): Promise<T> {
+		const previousProjectDir = getProjectDir();
+		const previousWorktreesDir = getWorktreesDir();
+		try {
+			setProjectDir(repo);
+			setWorktreesDir(managed);
+			return await run();
+		} finally {
+			setProjectDir(previousProjectDir);
+			setWorktreesDir(previousWorktreesDir);
+		}
+	}
+
+	async function seedIncludeFixture(repo: string): Promise<void> {
+		await fs.writeFile(path.join(repo, ".gitignore"), "*.env\n");
+		await fs.writeFile(path.join(repo, "local.env"), "SECRET=1\n");
+		await runGit(repo, ["add", ".gitignore"]);
+		await runGit(repo, ["commit", "-q", "-m", "ignore env"]);
+		await runGit(repo, ["push", "-q", "origin", "main"]);
+	}
+
+	test("a failed include copy rolls back the checkout and branch so retry re-seeds", async () => {
+		const fixture = await createRemoteFixture();
+		await seedIncludeFixture(fixture.repo);
+		// A symlinked .worktreeinclude is rejected by copyWorktreeIncludes.
+		await fs.writeFile(path.join(fixture.repo, "include-target"), "*.env\n");
+		await fs.symlink(path.join(fixture.repo, "include-target"), path.join(fixture.repo, ".worktreeinclude"));
+		const managed = path.join(fixture.root, "managed-worktrees");
+
+		await withWorktreeGlobals(fixture.repo, managed, async () => {
+			await expect(applyStartupWorktree(parseArgs(["-w", "inc-fail"]))).rejects.toThrow(/\.worktreeinclude/);
+			// Checkout AND the branch this launch created are gone — a leftover
+			// would make the retry skip seeding silently.
+			const entries = await fs.readdir(managed).catch(() => []);
+			expect(entries.filter(entry => entry.includes("inc-fail"))).toEqual([]);
+			await expect(
+				runGit(fixture.repo, ["rev-parse", "--verify", "refs/heads/worktree-inc-fail"]),
+			).rejects.toThrow();
+
+			// Fix the include file; the SAME name must now succeed and seed.
+			await fs.unlink(path.join(fixture.repo, ".worktreeinclude"));
+			await fs.writeFile(path.join(fixture.repo, ".worktreeinclude"), "*.env\n");
+			const worktree = await applyStartupWorktree(parseArgs(["-w", "inc-fail"]));
+			expect(worktree).not.toBeNull();
+			if (!worktree) throw new Error("retry launch returned null");
+			try {
+				expect(await Bun.file(path.join(worktree.path, "local.env")).text()).toBe("SECRET=1\n");
+			} finally {
+				await worktree.release();
+			}
+		});
+	});
+
+	test("a pre-existing branch without a checkout still seeds includes into the new directory", async () => {
+		const fixture = await createRemoteFixture();
+		await seedIncludeFixture(fixture.repo);
+		await fs.writeFile(path.join(fixture.repo, ".worktreeinclude"), "*.env\n");
+		// Leftover branch, no checkout — the omp worktree clear shape. Seeding is
+		// gated on directory creation, not branch reuse.
+		await runGit(fixture.repo, ["branch", "worktree-leftover"]);
+		const managed = path.join(fixture.root, "managed-worktrees");
+
+		await withWorktreeGlobals(fixture.repo, managed, async () => {
+			const worktree = await applyStartupWorktree(parseArgs(["-w", "leftover"]));
+			expect(worktree).not.toBeNull();
+			if (!worktree) throw new Error("leftover launch returned null");
+			try {
+				expect(worktree.reused).toBe(true);
+				expect(await Bun.file(path.join(worktree.path, "local.env")).text()).toBe("SECRET=1\n");
+			} finally {
+				await worktree.release();
+			}
+		});
+	});
+});
