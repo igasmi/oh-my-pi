@@ -7,7 +7,7 @@ import type { ToolSession } from "../tools";
 import { routeWriteThroughBridge } from "../tools/acp-bridge";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
-import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath } from "../tools/plan-mode-guard";
 import { type DiffError, type DiffResult, generateDiffString } from "./diff";
 import { levenshteinDistance } from "./modes/replace";
 import { detectLineEnding, normalizeToLF, normalizeUnicode, restoreLineEndings, stripBom } from "./normalize";
@@ -3593,7 +3593,7 @@ export async function executeSloppy(
 			}
 		}
 
-		enforcePlanModeWrite(session, path);
+		enforceWriteGuards(session, path);
 
 		const rawContent = await readEditFileText(absolutePath, path);
 		const { bom, text: fileText } = stripBom(rawContent);

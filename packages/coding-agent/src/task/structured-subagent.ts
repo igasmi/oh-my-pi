@@ -389,6 +389,8 @@ function buildExecutorOptions(
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
+		worktreeIsolation: session.getWorktreeIsolation?.(),
+		worktreeWriteGuard: session.getWorktreeWriteGuard?.() ?? session.getWorktreeIsolation?.(),
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),

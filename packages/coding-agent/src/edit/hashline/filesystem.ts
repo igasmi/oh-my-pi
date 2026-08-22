@@ -28,7 +28,7 @@ import { assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { deleteFileWithFallback, writeFileWithFallback } from "../../tools/file-write-fallback";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { isInternalUrlPath } from "../../tools/path-utils";
-import { enforcePlanModeWrite, resolvePlanPath, targetsLocalSandbox } from "../../tools/plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath, targetsLocalSandbox } from "../../tools/plan-mode-guard";
 import { canonicalSnapshotKey } from "../file-snapshot-store";
 import { isNotebookPath } from "../notebook";
 import { readEditFileText, serializeEditFileText } from "../read-file";
@@ -140,18 +140,18 @@ export class HashlineFilesystem extends Filesystem {
 	override async preflightWrite(relativePath: string, options?: PreflightWriteOptions): Promise<void> {
 		const fileOp = options?.fileOp;
 		if (fileOp?.kind === "rem") {
-			enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
+			enforceWriteGuards(this.session, relativePath, { op: "delete" });
 			return;
 		}
 		if (fileOp?.kind === "move") {
-			enforcePlanModeWrite(this.session, relativePath, { op: "update", move: fileOp.dest });
+			enforceWriteGuards(this.session, relativePath, { op: "update", move: fileOp.dest });
 			return;
 		}
-		enforcePlanModeWrite(this.session, relativePath, { op: "update" });
+		enforceWriteGuards(this.session, relativePath, { op: "update" });
 	}
 
 	override async delete(relativePath: string): Promise<void> {
-		enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
+		enforceWriteGuards(this.session, relativePath, { op: "delete" });
 		const absolutePath = this.resolveAbsolute(relativePath);
 		try {
 			await deleteFileWithFallback(absolutePath);
@@ -170,7 +170,7 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	override async move(fromRelative: string, toRelative: string, content?: string): Promise<void> {
-		enforcePlanModeWrite(this.session, fromRelative, { op: "update", move: toRelative });
+		enforceWriteGuards(this.session, fromRelative, { op: "update", move: toRelative });
 		const fromAbsolute = this.resolveAbsolute(fromRelative);
 		const toAbsolute = this.resolveAbsolute(toRelative);
 		if (content !== undefined) {

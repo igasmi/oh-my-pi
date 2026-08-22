@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { WorktreeIsolation } from "@oh-my-pi/pi-coding-agent/session/worktree-isolation";
+import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { copyWorktreeIncludes } from "@oh-my-pi/pi-coding-agent/worktree/worktree-include";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -70,6 +71,7 @@ describe("worktree include copying", () => {
 		const result = await copyWorktreeIncludes(isolation);
 
 		expect(result.copiedPaths).toEqual(["ignored/secret.txt", "local.env"]);
+		expect(result.skippedSymlinks).toEqual([]);
 		expect(await fs.readFile(path.join(worktreeRoot, "ignored", "secret.txt"), "utf8")).toBe("secret\n");
 		expect(await fs.readFile(path.join(worktreeRoot, "local.env"), "utf8")).toBe("TOKEN=local\n");
 		expect(await fs.stat(path.join(worktreeRoot, "tracked.txt")).catch(() => null)).toBeNull();
@@ -92,12 +94,13 @@ describe("worktree include copying", () => {
 		const result = await copyWorktreeIncludes(isolation);
 
 		expect(result.copiedPaths).toEqual(["cache/public.txt"]);
+		expect(result.skippedSymlinks).toEqual([]);
 		expect(await fs.readFile(path.join(worktreeRoot, "cache", "public.txt"), "utf8")).toBe("copy\n");
 		expect(await fs.stat(path.join(worktreeRoot, "cache", "private.txt")).catch(() => null)).toBeNull();
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"rejects selected symlinks without following them and rolls back earlier copies",
+		"skips symlinked source files while copying regular files without following links",
 		async () => {
 			const { isolation, primaryRoot, worktreeRoot } = await createFixture();
 			const outside = path.join(path.dirname(primaryRoot), "outside.txt");
@@ -107,9 +110,74 @@ describe("worktree include copying", () => {
 			await fs.writeFile(path.join(primaryRoot, "a-copy.env"), "copied first\n");
 			await fs.symlink(outside, path.join(primaryRoot, "z-link"));
 
-			await expect(copyWorktreeIncludes(isolation)).rejects.toThrow(/symlink selected by \.worktreeinclude/);
-			expect(await fs.stat(path.join(worktreeRoot, "a-copy.env")).catch(() => null)).toBeNull();
+			const result = await copyWorktreeIncludes(isolation);
+
+			expect(result.copiedPaths).toEqual(["a-copy.env"]);
+			expect(result.skippedSymlinks).toEqual(["z-link"]);
+			expect(await fs.readFile(path.join(worktreeRoot, "a-copy.env"), "utf8")).toBe("copied first\n");
+			expect(await fs.stat(path.join(worktreeRoot, "z-link")).catch(() => null)).toBeNull();
 			expect(await fs.readFile(outside, "utf8")).toBe("must stay outside\n");
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"rejects symlinked source directory components and rolls back earlier copies",
+		async () => {
+			const { isolation, primaryRoot, worktreeRoot } = await createFixture();
+			const outsideDir = path.join(path.dirname(primaryRoot), "outside-dir");
+			await fs.mkdir(outsideDir);
+			await fs.writeFile(path.join(outsideDir, "secret.txt"), "secret\n");
+			await fs.writeFile(path.join(primaryRoot, ".gitignore"), "*.env\n");
+			await fs.writeFile(path.join(primaryRoot, ".worktreeinclude"), "*.env\n");
+			await fs.writeFile(path.join(primaryRoot, "a-copy.env"), "copied first\n");
+			await fs.symlink(outsideDir, path.join(primaryRoot, "symdir"));
+
+			const spy = spyOn(git.ls, "ignored").mockImplementation(async () => ["a-copy.env", "symdir/secret.txt"]);
+			try {
+				await expect(copyWorktreeIncludes(isolation)).rejects.toThrow(/symlink selected by \.worktreeinclude/);
+				expect(await fs.stat(path.join(worktreeRoot, "a-copy.env")).catch(() => null)).toBeNull();
+				expect(await fs.stat(path.join(worktreeRoot, "symdir")).catch(() => null)).toBeNull();
+			} finally {
+				spy.mockRestore();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"rejects symlinked destination directory components and rolls back earlier copies",
+		async () => {
+			const { isolation, primaryRoot, worktreeRoot } = await createFixture();
+			const outsideDir = path.join(path.dirname(primaryRoot), "outside-dir");
+			await fs.mkdir(outsideDir);
+			await fs.writeFile(path.join(primaryRoot, ".gitignore"), "*.env\nnested/\n");
+			await fs.writeFile(path.join(primaryRoot, ".worktreeinclude"), "*.env\nnested/secret.txt\n");
+			await fs.writeFile(path.join(primaryRoot, "a-copy.env"), "copied first\n");
+			await fs.mkdir(path.join(primaryRoot, "nested"));
+			await fs.writeFile(path.join(primaryRoot, "nested", "secret.txt"), "secret\n");
+			await fs.symlink(outsideDir, path.join(worktreeRoot, "nested"));
+
+			await expect(copyWorktreeIncludes(isolation)).rejects.toThrow(/Refusing unsafe destination path/);
+			expect(await fs.stat(path.join(worktreeRoot, "a-copy.env")).catch(() => null)).toBeNull();
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"rejects unsafe destination symlinks and rolls back earlier copies",
+		async () => {
+			const { isolation, primaryRoot, worktreeRoot } = await createFixture();
+			const outsideFile = path.join(path.dirname(primaryRoot), "outside-dest.txt");
+			await fs.writeFile(outsideFile, "do not overwrite\n");
+			await fs.writeFile(path.join(primaryRoot, ".gitignore"), "*.env\n");
+			await fs.writeFile(path.join(primaryRoot, ".worktreeinclude"), "*.env\n");
+			await fs.writeFile(path.join(primaryRoot, "a.env"), "first\n");
+			await fs.writeFile(path.join(primaryRoot, "z.env"), "second\n");
+			await fs.symlink(outsideFile, path.join(worktreeRoot, "z.env"));
+
+			await expect(copyWorktreeIncludes(isolation)).rejects.toThrow(
+				/Refusing to overwrite|Refusing unsafe destination/,
+			);
+			expect(await fs.stat(path.join(worktreeRoot, "a.env")).catch(() => null)).toBeNull();
+			expect(await fs.readFile(outsideFile, "utf8")).toBe("do not overwrite\n");
 		},
 	);
 
@@ -138,6 +206,7 @@ describe("worktree include copying", () => {
 		const result = await copyWorktreeIncludes(isolation);
 
 		expect(result.copiedPaths).toEqual(["..cache/token"]);
+		expect(result.skippedSymlinks).toEqual([]);
 		expect(await fs.readFile(path.join(worktreeRoot, "..cache", "token"), "utf8")).toBe("secret-token\n");
 	});
 });

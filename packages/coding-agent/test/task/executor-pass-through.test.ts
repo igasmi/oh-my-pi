@@ -17,6 +17,7 @@ import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { WorktreeIsolation } from "@oh-my-pi/pi-coding-agent/session/worktree-isolation";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -159,6 +160,71 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.rules).toBeUndefined();
 		expect(forwarded?.preloadedExtensionPaths).toBeUndefined();
 		expect(forwarded?.preloadedCustomToolPaths).toBeUndefined();
+	});
+
+	it("threads the parent -w binding into the subagent session manager and SDK guard context", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const binding: WorktreeIsolation = {
+			worktreeRoot: "/tmp",
+			primaryRoot: "/tmp-primary-checkout",
+			name: "wt",
+			branch: "worktree-wt",
+			commonDir: "/tmp-primary-checkout/.git",
+		};
+
+		const result = await runSubprocess({ ...baseOptions, worktreeIsolation: binding });
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.sessionManager?.getWorktreeIsolation()?.worktreeRoot).toBe(binding.worktreeRoot);
+		expect(forwarded?.worktreeWriteGuard).toBe(binding);
+	});
+
+	it("keeps the write-guard context for task-isolated runs while withholding the manager binding", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const binding: WorktreeIsolation = {
+			worktreeRoot: "/tmp",
+			primaryRoot: "/tmp-primary-checkout",
+			name: "wt",
+			branch: "worktree-wt",
+			commonDir: "/tmp-primary-checkout/.git",
+		};
+
+		// `worktree` = task-isolation sandbox dir. The manager cannot hold the
+		// binding (its cwd is the sandbox, not the -w worktree), but the child's
+		// file tools must still refuse absolute writes into the primary checkout
+		// — the sandbox merge never sees those — so the SDK guard context stays.
+		const result = await runSubprocess({ ...baseOptions, worktree: "/tmp", worktreeIsolation: binding });
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.sessionManager?.getWorktreeIsolation()).toBeUndefined();
+		expect(forwarded?.worktreeWriteGuard).toBe(binding);
+	});
+
+	it("spawns a grandchild from an isolated child: guard context flows, manager binding stays absent", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const binding: WorktreeIsolation = {
+			worktreeRoot: "/tmp-elsewhere-worktree",
+			primaryRoot: "/tmp-primary-checkout",
+			name: "wt",
+			branch: "worktree-wt",
+			commonDir: "/tmp-primary-checkout/.git",
+		};
+
+		// Regression: an isolated child (sandbox cwd, no manager binding) spawning
+		// a non-isolated grandchild forwards ONLY the guard context. Before the
+		// split this arrived as `worktreeIsolation` and the grandchild's manager
+		// threw a cwd/worktreeRoot mismatch at spawn.
+		const result = await runSubprocess({ ...baseOptions, worktreeWriteGuard: binding });
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.sessionManager?.getWorktreeIsolation()).toBeUndefined();
+		expect(forwarded?.worktreeWriteGuard).toBe(binding);
 	});
 
 	it("records the spawning agent as parentAgentId, distinct from the child's own id and prefix", async () => {

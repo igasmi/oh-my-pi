@@ -240,7 +240,7 @@ describe.serial("startup worktrees", () => {
 		expect(await fs.readFile(path.join(worktreePath, "unfinished.txt"), "utf8")).toBe("dirty work must survive\n");
 	});
 
-	test("worktree clear --all unlocks and removes an active managed session", async () => {
+	test("worktree clear --all preserves a live-locked session and removes it after release", async () => {
 		const { repo } = await createRepo();
 		const worktree = await enter("clearable-session");
 		setProjectDir(repo);
@@ -249,6 +249,16 @@ describe.serial("startup worktrees", () => {
 			output.push(values.map(String).join(" "));
 		});
 
+		await clearWorktrees({ all: true, dryRun: false, json: true });
+
+		expect(JSON.parse(output.join("\n"))).toEqual({ removed: 0, kept: 1 });
+		expect(await fs.stat(worktree.path).catch(() => null)).not.toBeNull();
+		expect(
+			(await git.worktree.list(repo)).some(entry => entry.branch === "refs/heads/worktree-clearable-session"),
+		).toBe(true);
+
+		output.length = 0;
+		await worktree.release();
 		await clearWorktrees({ all: true, dryRun: false, json: true });
 
 		expect(JSON.parse(output.join("\n"))).toMatchObject({ removed: 1, failed: 0 });

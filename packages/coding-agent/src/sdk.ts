@@ -348,17 +348,25 @@ function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
 	}
 }
 
+import type { WorktreeIsolation } from "./session/worktree-isolation";
 // Types
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
+	/**
+	 * Worktree write-guard context, propagated to every descendant subagent.
+	 * Distinct from the manager's persisted binding: a task-isolated child runs
+	 * outside the `-w` worktree (its manager holds no binding, and persisting
+	 * one would fail the cwd check), yet its file tools must still refuse
+	 * absolute writes into the primary checkout.
+	 */
+	worktreeWriteGuard?: WorktreeIsolation;
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
 	spawns?: string;
-
 	/** Auth storage for credentials. Default: discoverAuthStorage(agentDir) */
 	authStorage?: AuthStorage;
 	/** Model registry. Default: discoverModels(authStorage, agentDir) */
@@ -1748,7 +1756,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getGoalRuntime: () => session?.goalRuntime,
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
 			getTurnBudget: () => sessionManager.getTurnBudget(),
-			recordEvalSubagentUsage: output => sessionManager.recordEvalSubagentOutput(output),
+			getWorktreeIsolation: () => sessionManager.getWorktreeIsolation(),
+			getWorktreeWriteGuard: () => sessionManager.getWorktreeIsolation() ?? options.worktreeWriteGuard,
 			getClientBridge: () => session?.clientBridge,
 			queueDeferredDiagnostics: entry => session?.yieldQueue.enqueue(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, entry),
 			queueLaunchCompletion: notification =>

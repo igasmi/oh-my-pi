@@ -33,7 +33,7 @@ import {
 } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
-import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { ToolError } from "../../tools/tool-errors";
 import {
 	ApplyPatchError,
@@ -1838,7 +1838,7 @@ export async function executePatchSingle(
 
 	const op: Operation = rawOp === "create" || rawOp === "delete" ? rawOp : "update";
 
-	enforcePlanModeWrite(session, path, { op, move: rename });
+	enforceWriteGuards(session, path, { op, move: rename });
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 

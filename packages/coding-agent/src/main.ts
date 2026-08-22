@@ -99,6 +99,7 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
+import { filterWorktreeAdditionalDirectories, type WorktreeIsolation } from "./session/worktree-isolation";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
@@ -884,6 +885,7 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 	askToMoveSession: SessionPrompt = promptMoveSession,
+	worktreeIsolation?: WorktreeIsolation,
 ): Promise<SessionManager | undefined> {
 	if (parsed.fork) {
 		if (parsed.noSession) {
@@ -904,7 +906,7 @@ export async function createSessionManager(
 	}
 
 	if (parsed.noSession) {
-		return SessionManager.inMemory();
+		return SessionManager.inMemory(cwd, undefined, { worktreeIsolation });
 	}
 	normalizeContinueSessionArgs(parsed);
 
@@ -953,23 +955,28 @@ export async function createSessionManager(
 		return await SessionManager.open(match.session.path, parsed.sessionDir);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, { worktreeIsolation });
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, parsed.sessionDir);
+		return SessionManager.create(cwd, parsed.sessionDir, undefined, { worktreeIsolation });
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, { worktreeIsolation });
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
 		return manager;
+	}
+	// A worktree launch must persist its isolation binding into the fresh
+	// session header, so it cannot defer manager creation to the SDK default.
+	if (worktreeIsolation) {
+		return SessionManager.create(cwd, parsed.sessionDir, undefined, { worktreeIsolation });
 	}
 	// Default case (new session) returns undefined, SDK will create one
 	return undefined;
@@ -1403,6 +1410,21 @@ export async function runRootCommand(
 				);
 				if (startupWorktree) {
 					await preloadedSettings.reloadForCwd(startupWorktree.path);
+					if (parsedArgs.addDir?.length) {
+						const filtered = await filterWorktreeAdditionalDirectories(
+							startupWorktree.isolation,
+							parsedArgs.addDir,
+						);
+						const dropped = parsedArgs.addDir.length - filtered.length;
+						if (dropped > 0) {
+							// The filter also drops missing paths, symlink aliases, duplicates,
+							// and worktree-internal entries — keep the notice cause-neutral.
+							process.stderr.write(
+								`${chalk.yellow(`Ignored ${dropped} --add-dir ${dropped === 1 ? "entry" : "entries"} not usable in this worktree session (inside the primary checkout, missing, symlinked, or redundant).`)}\n`,
+							);
+						}
+						parsedArgs.addDir = filtered;
+					}
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1667,6 +1689,8 @@ export async function runRootCommand(
 					parsedArgs,
 					cwd,
 					settingsInstance,
+					undefined,
+					startupWorktree?.isolation,
 				);
 			}
 		} catch (error: unknown) {

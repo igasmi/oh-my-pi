@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { WorktreeIsolation } from "@oh-my-pi/pi-coding-agent/session/worktree-isolation";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { enforcePlanModeWrite, resolvePlanPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const ARTIFACTS_DIR = path.join(os.tmpdir(), "agent-artifacts");
@@ -16,6 +18,7 @@ interface SessionOverrides {
 	sessionId?: string | null;
 	cwd?: string;
 	planMode?: PlanModeState;
+	worktreeIsolation?: WorktreeIsolation;
 }
 
 function makeSession(overrides: SessionOverrides): ToolSession {
@@ -30,6 +33,7 @@ function makeSession(overrides: SessionOverrides): ToolSession {
 		getArtifactsDir: () => overrides.artifactsDir ?? null,
 		getSessionId: () => overrides.sessionId ?? null,
 		getPlanModeState: () => overrides.planMode,
+		getWorktreeIsolation: () => overrides.worktreeIsolation,
 	} as unknown as ToolSession;
 }
 
@@ -84,38 +88,120 @@ describe("resolvePlanPath resolves literally (no plan-mode redirect)", () => {
 	});
 });
 
-describe("enforcePlanModeWrite (working tree read-only, local:// sandbox writable)", () => {
+describe("enforceWriteGuards plan mode (working tree read-only, local:// sandbox writable)", () => {
 	const planMode: PlanModeState = { enabled: true, planFilePath: "local://some-plan.md" };
 
 	it("accepts writes to any local:// file", () => {
 		const session = makeSession({ artifactsDir: ARTIFACTS_DIR, planMode });
-		expect(() => enforcePlanModeWrite(session, "local://auth-refactor-plan.md", { op: "create" })).not.toThrow();
-		expect(() => enforcePlanModeWrite(session, "local://scratch/notes.md", { op: "update" })).not.toThrow();
+		expect(() => enforceWriteGuards(session, "local://auth-refactor-plan.md", { op: "create" })).not.toThrow();
+		expect(() => enforceWriteGuards(session, "local://scratch/notes.md", { op: "update" })).not.toThrow();
 	});
 
 	it("rejects writes to the working tree", () => {
 		const session = makeSession({ artifactsDir: ARTIFACTS_DIR, cwd: REPO_ROOT, planMode });
-		expect(() => enforcePlanModeWrite(session, "src/foo.ts", { op: "update" })).toThrow(/working tree is read-only/);
-		expect(() => enforcePlanModeWrite(session, "PLAN.md", { op: "create" })).toThrow(/working tree is read-only/);
+		expect(() => enforceWriteGuards(session, "src/foo.ts", { op: "update" })).toThrow(/working tree is read-only/);
+		expect(() => enforceWriteGuards(session, "PLAN.md", { op: "create" })).toThrow(/working tree is read-only/);
 	});
 
 	it("rejects deletes and renames outright", () => {
 		const session = makeSession({ artifactsDir: ARTIFACTS_DIR, planMode });
-		expect(() => enforcePlanModeWrite(session, "local://some-plan.md", { op: "delete" })).toThrow(
+		expect(() => enforceWriteGuards(session, "local://some-plan.md", { op: "delete" })).toThrow(
 			/deleting files is not allowed/,
 		);
-		expect(() => enforcePlanModeWrite(session, "local://some-plan.md", { move: "local://renamed.md" })).toThrow(
+		expect(() => enforceWriteGuards(session, "local://some-plan.md", { move: "local://renamed.md" })).toThrow(
 			/renaming files is not allowed/,
 		);
 	});
 
 	it("is a no-op when plan mode is disabled", () => {
 		const session = makeSession({ artifactsDir: ARTIFACTS_DIR, cwd: REPO_ROOT });
-		expect(() => enforcePlanModeWrite(session, "src/foo.ts", { op: "update" })).not.toThrow();
+		expect(() => enforceWriteGuards(session, "src/foo.ts", { op: "update" })).not.toThrow();
 	});
 });
 
-describe("enforcePlanModeWrite accepts absolute local-sandbox paths", () => {
+describe("enforceWriteGuards worktree isolation (primary checkout refused)", () => {
+	let primaryRoot: string;
+	let worktreeRoot: string;
+	let isolation: WorktreeIsolation;
+
+	async function setup(): Promise<void> {
+		const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-guard-")));
+		primaryRoot = path.join(base, "primary");
+		worktreeRoot = path.join(base, "wt");
+		await fs.mkdir(primaryRoot, { recursive: true });
+		await fs.mkdir(worktreeRoot, { recursive: true });
+		isolation = {
+			worktreeRoot,
+			primaryRoot,
+			name: "guard-test",
+			branch: "worktree-guard-test",
+			commonDir: path.join(primaryRoot, ".git"),
+		};
+	}
+
+	it("refuses writes, moves into, and deletes inside the primary checkout", async () => {
+		await setup();
+		const session = makeSession({ cwd: worktreeRoot, worktreeIsolation: isolation });
+		const primaryFile = path.join(primaryRoot, "src", "index.ts");
+		expect(() => enforceWriteGuards(session, primaryFile, { op: "update" })).toThrow(/primary checkout/);
+		expect(() => enforceWriteGuards(session, primaryFile, { op: "create" })).toThrow(/primary checkout/);
+		expect(() => enforceWriteGuards(session, path.join(worktreeRoot, "ok.ts"), { move: primaryFile })).toThrow(
+			/primary checkout/,
+		);
+	});
+
+	it("allows writes inside the worktree and outside both roots", async () => {
+		await setup();
+		const session = makeSession({ cwd: worktreeRoot, worktreeIsolation: isolation });
+		expect(() => enforceWriteGuards(session, "src/new.ts", { op: "create" })).not.toThrow();
+		expect(() => enforceWriteGuards(session, path.join(os.tmpdir(), "scratch.txt"), { op: "create" })).not.toThrow();
+	});
+
+	it("refuses a symlinked path that resolves into the primary checkout", async () => {
+		await setup();
+		const link = path.join(worktreeRoot, "escape");
+		await fs.symlink(primaryRoot, link);
+		const session = makeSession({ cwd: worktreeRoot, worktreeIsolation: isolation });
+		expect(() => enforceWriteGuards(session, path.join(link, "sneaky.ts"), { op: "create" })).toThrow(
+			/primary checkout/,
+		);
+	});
+
+	it("is a no-op without a binding", async () => {
+		await setup();
+		const session = makeSession({ cwd: worktreeRoot });
+		expect(() => enforceWriteGuards(session, path.join(primaryRoot, "free.ts"), { op: "update" })).not.toThrow();
+	});
+
+	it("refuses primary writes when the binding flows through a subagent-shaped SessionManager", async () => {
+		await setup();
+		// Mirror the executor's non-isolated spawn (SessionManager.inMemory with
+		// the inherited binding) and the SDK's ToolSession accessor wiring.
+		const manager = SessionManager.inMemory(worktreeRoot, undefined, { worktreeIsolation: isolation });
+		const session = makeSession({ cwd: worktreeRoot, worktreeIsolation: manager.getWorktreeIsolation() });
+		expect(() => enforceWriteGuards(session, path.join(primaryRoot, "src", "index.ts"), { op: "update" })).toThrow(
+			/primary checkout/,
+		);
+		expect(() => enforceWriteGuards(session, "src/child-ok.ts", { op: "create" })).not.toThrow();
+	});
+
+	it("refuses primary writes from an isolated-sandbox cwd (guard context without manager binding)", async () => {
+		await setup();
+		// Task-isolated children run OUTSIDE the -w worktree; the binding reaches
+		// them via the SDK guard context. Absolute primary paths stay refused,
+		// sandbox-local work is untouched.
+		const base = path.dirname(worktreeRoot);
+		const sandbox = path.join(base, "sandbox");
+		await fs.mkdir(sandbox, { recursive: true });
+		const session = makeSession({ cwd: sandbox, worktreeIsolation: isolation });
+		expect(() => enforceWriteGuards(session, path.join(primaryRoot, "src", "index.ts"), { op: "update" })).toThrow(
+			/primary checkout/,
+		);
+		expect(() => enforceWriteGuards(session, "sandbox-local.ts", { op: "create" })).not.toThrow();
+	});
+});
+
+describe("enforceWriteGuards accepts absolute local-sandbox paths", () => {
 	const planMode: PlanModeState = { enabled: true, planFilePath: "local://some-plan.md" };
 
 	it("allows the absolute path returned by `read local://...` (== sandbox-resolved path)", async () => {
@@ -125,7 +211,7 @@ describe("enforcePlanModeWrite accepts absolute local-sandbox paths", () => {
 		try {
 			const session = makeSession({ artifactsDir, planMode });
 			const absolute = resolvePlanPath(session, "local://my-plan.md");
-			expect(() => enforcePlanModeWrite(session, absolute, { op: "update" })).not.toThrow();
+			expect(() => enforceWriteGuards(session, absolute, { op: "update" })).not.toThrow();
 		} finally {
 			await removeWithRetries(artifactsDir);
 		}
@@ -139,9 +225,9 @@ describe("enforcePlanModeWrite accepts absolute local-sandbox paths", () => {
 
 			// Strict hashline shape `[PATH]` or `[PATH#XXXX]` is unwrapped to the
 			// inner path for both the sandbox check and the eventual resolution.
-			expect(() => enforcePlanModeWrite(session, `[${absolute}#ABCD]`, { op: "update" })).not.toThrow();
-			expect(() => enforcePlanModeWrite(session, `[${absolute}]`, { op: "update" })).not.toThrow();
-			expect(() => enforcePlanModeWrite(session, `[local://my-plan.md#ABCD]`, { op: "update" })).not.toThrow();
+			expect(() => enforceWriteGuards(session, `[${absolute}#ABCD]`, { op: "update" })).not.toThrow();
+			expect(() => enforceWriteGuards(session, `[${absolute}]`, { op: "update" })).not.toThrow();
+			expect(() => enforceWriteGuards(session, `[local://my-plan.md#ABCD]`, { op: "update" })).not.toThrow();
 		} finally {
 			await removeWithRetries(artifactsDir);
 		}
@@ -154,10 +240,10 @@ describe("enforcePlanModeWrite accepts absolute local-sandbox paths", () => {
 		// Selector tails (`#TAG:lines`), non-hex tags, and short tags fall outside
 		// the strict header shape; we leave them alone so the downstream resolver
 		// surfaces the real error rather than treating the bracketed blob as a path.
-		expect(() => enforcePlanModeWrite(session, `[${sandboxPlanPath}#ABCD:1-2]`, { op: "update" })).toThrow(
+		expect(() => enforceWriteGuards(session, `[${sandboxPlanPath}#ABCD:1-2]`, { op: "update" })).toThrow(
 			/working tree is read-only/,
 		);
-		expect(() => enforcePlanModeWrite(session, `[${sandboxPlanPath}#nothex]`, { op: "update" })).toThrow(
+		expect(() => enforceWriteGuards(session, `[${sandboxPlanPath}#nothex]`, { op: "update" })).toThrow(
 			/working tree is read-only/,
 		);
 	});
@@ -166,10 +252,8 @@ describe("enforcePlanModeWrite accepts absolute local-sandbox paths", () => {
 		const session = makeSession({ artifactsDir: ARTIFACTS_DIR, cwd: REPO_ROOT, planMode });
 		const workingTreePath = path.join(REPO_ROOT, "src", "foo.ts");
 
-		expect(() => enforcePlanModeWrite(session, workingTreePath, { op: "update" })).toThrow(
-			/working tree is read-only/,
-		);
-		expect(() => enforcePlanModeWrite(session, `[${workingTreePath}#ABCD]`, { op: "update" })).toThrow(
+		expect(() => enforceWriteGuards(session, workingTreePath, { op: "update" })).toThrow(/working tree is read-only/);
+		expect(() => enforceWriteGuards(session, `[${workingTreePath}#ABCD]`, { op: "update" })).toThrow(
 			/working tree is read-only/,
 		);
 	});

@@ -12,7 +12,7 @@ import type { ToolSession } from "../../tools";
 import { routeWriteThroughBridge } from "../../tools/acp-bridge";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
-import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { generateDiffString, replaceText } from "../diff";
 import {
 	countLeadingWhitespace,
@@ -1133,7 +1133,7 @@ export async function executeReplace(
 	} = options;
 	const { old_string, new_string, replace_all } = params;
 
-	enforcePlanModeWrite(session, path);
+	enforceWriteGuards(session, path);
 
 	if (old_string.length === 0) {
 		throw new Error("old_string must not be empty.");

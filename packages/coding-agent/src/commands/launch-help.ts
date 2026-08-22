@@ -41,7 +41,8 @@ export const launchHelp = {
 		cwd: Flags.string({ description: "Directory to start in (overrides the launch cwd)" }),
 		worktree: Flags.string({
 			char: "w",
-			description: "Start in an isolated git worktree (name optional; bare -w generates one)",
+			description:
+				"Start in an isolated git worktree branched from the remote default branch (name optional; bare -w generates one; #N or a GitHub/GitLab URL checks out that pull request)",
 		}),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, rpc, or rpc-ui",

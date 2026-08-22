@@ -5,8 +5,6 @@ import * as path from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
-	assertWorktreeMutationAllowed,
-	classifyWorktreePath,
 	filterWorktreeAdditionalDirectories,
 	validateWorktreeIsolation,
 	type WorktreeIsolation,
@@ -72,7 +70,6 @@ async function createWorktreeFixture(prefix = "omp-worktree-isolation-"): Promis
 			name: "binding",
 			branch: "worktree-binding",
 			commonDir,
-			managed: true,
 		},
 	};
 }
@@ -225,24 +222,6 @@ describe("worktree isolation binding", () => {
 		expect((tamperedError as WorktreeIsolationError).code).toBe("tampered");
 	});
 
-	test("primary checkout classification overrides additional-directory authorization", async () => {
-		const fixture = await createWorktreeFixture();
-		const primaryFile = path.join(fixture.primaryRoot, "tracked.txt");
-
-		const classification = await classifyWorktreePath(fixture.isolation, primaryFile, {
-			additionalDirectories: [fixture.primaryRoot],
-		});
-
-		expect(classification).toEqual({ kind: "primary", canonicalPath: primaryFile });
-		const mutationError = await rejectionOf(
-			assertWorktreeMutationAllowed(fixture.isolation, primaryFile, {
-				additionalDirectories: [fixture.primaryRoot],
-			}),
-		);
-		expect(mutationError).toBeInstanceOf(WorktreeIsolationError);
-		expect((mutationError as WorktreeIsolationError).code).toBe("primary");
-	});
-
 	test("filters primary roots and symlink aliases while retaining canonical external roots", async () => {
 		const fixture = await createWorktreeFixture();
 		const primaryChild = path.join(fixture.primaryRoot, "child");
@@ -262,19 +241,53 @@ describe("worktree isolation binding", () => {
 		expect(filtered).toEqual([external]);
 	});
 
-	test("classifies a followed symlink into primary as protected but the link itself as worktree-owned", async () => {
+	test("subagent-style open of an empty child file persists the inherited binding for revive", async () => {
 		const fixture = await createWorktreeFixture();
-		const link = path.join(fixture.worktreeRoot, "primary-link");
-		await fs.symlink(fixture.primaryRoot, link, "dir");
+		const childFile = path.join(fixture.root, "sessions", "child.jsonl");
 
-		expect(await classifyWorktreePath(fixture.isolation, link)).toEqual({
-			kind: "primary",
-			canonicalPath: fixture.primaryRoot,
+		// First open mirrors the executor's non-isolated spawn: empty file +
+		// inherited parent binding. The header must land on disk immediately so
+		// a later revive (open WITHOUT the option) still fails closed.
+		const child = await SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+			initialCwd: fixture.worktreeRoot,
+			suppressBreadcrumb: true,
+			worktreeIsolation: fixture.isolation,
 		});
-		expect(await classifyWorktreePath(fixture.isolation, link, { followFinal: false })).toEqual({
-			kind: "worktree",
-			canonicalPath: link,
+		expect(child.getWorktreeIsolation()?.worktreeRoot).toBe(fixture.isolation.worktreeRoot);
+		await child.flush();
+
+		const persisted = JSON.parse(
+			(await Bun.file(childFile).text()).split("\n").find(line => line.includes('"type":"session"')) ?? "null",
+		) as { worktreeIsolation?: WorktreeIsolation } | null;
+		expect(persisted?.worktreeIsolation?.worktreeRoot).toBe(fixture.isolation.worktreeRoot);
+
+		// Revive path: reopening without the inherited option validates the
+		// persisted binding (worktree removed -> fails closed).
+		const revived = await SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+			suppressBreadcrumb: true,
 		});
+		expect(revived.getWorktreeIsolation()?.worktreeRoot).toBe(fixture.isolation.worktreeRoot);
+		await fs.rm(fixture.worktreeRoot, { recursive: true, force: true });
+		const failed = await rejectionOf(
+			SessionManager.open(childFile, undefined, new FileSessionStorage(), { suppressBreadcrumb: true }),
+		);
+		expect(failed).toBeInstanceOf(WorktreeIsolationError);
+	});
+
+	test("inherited binding is rejected when the child cwd is outside the worktree (isolated-sandbox shape)", async () => {
+		const fixture = await createWorktreeFixture();
+		const sandbox = path.join(fixture.root, "sandbox");
+		await fs.mkdir(sandbox);
+		const childFile = path.join(fixture.root, "sessions", "isolated-child.jsonl");
+
+		const error = await rejectionOf(
+			SessionManager.open(childFile, undefined, new FileSessionStorage(), {
+				initialCwd: sandbox,
+				suppressBreadcrumb: true,
+				worktreeIsolation: fixture.isolation,
+			}),
+		);
+		expect(error).toBeInstanceOf(WorktreeIsolationError);
 	});
 
 	test("preserves all session manager state when newSession is called with a mismatched worktree binding", async () => {
@@ -309,5 +322,63 @@ describe("worktree isolation binding", () => {
 		expect(manager.getSessionName()).toBe(originalTitle);
 		expect(manager.titleSource).toBe(originalTitleSource);
 		expect(manager.getEntries()).toEqual(originalEntries);
+	});
+
+	test("preserves all session manager state when setSessionFile fails validation without external restoreState", async () => {
+		const fixture = await createWorktreeFixture("omp-worktree-isolation-valid-");
+		const foreign = await createWorktreeFixture("omp-worktree-isolation-foreign-");
+		const sessionDir = path.join(fixture.root, "sessions");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(fixture.worktreeRoot, sessionDir, storage, {
+			worktreeIsolation: fixture.isolation,
+		});
+		await manager.ensureOnDisk();
+		manager.setSessionName("Valid Session Name", "user");
+		manager.appendSessionInit({ systemPrompt: "test system prompt", task: "initial task", tools: ["read"] });
+		await manager.flush();
+
+		const originalSessionId = manager.getSessionId();
+		const originalSessionFile = manager.getSessionFile();
+		const originalIsolation = manager.getWorktreeIsolation();
+		const originalHeader = manager.getHeader();
+		const originalTitle = manager.getSessionName();
+		const originalTitleSource = manager.titleSource;
+		const originalEntries = manager.getEntries();
+		const originalCwd = manager.getCwd();
+
+		const foreignSessionDir = path.join(foreign.root, "sessions");
+		const foreignManager = SessionManager.create(foreign.worktreeRoot, foreignSessionDir, storage, {
+			worktreeIsolation: foreign.isolation,
+		});
+		await foreignManager.ensureOnDisk();
+		const foreignSessionFile = foreignManager.getSessionFile();
+		if (!foreignSessionFile) throw new Error("Expected foreign session file");
+
+		await fs.rm(foreign.worktreeRoot, { recursive: true, force: true });
+
+		const error = await rejectionOf(manager.setSessionFile(foreignSessionFile));
+		expect(error).toBeInstanceOf(WorktreeIsolationError);
+
+		expect(manager.getSessionId()).toBe(originalSessionId);
+		expect(manager.getSessionFile()).toBe(originalSessionFile);
+		expect(manager.getWorktreeIsolation()).toEqual(originalIsolation);
+		expect(manager.getHeader()).toEqual(originalHeader);
+		expect(manager.getSessionName()).toBe(originalTitle);
+		expect(manager.titleSource).toBe(originalTitleSource);
+		expect(manager.getEntries()).toEqual(originalEntries);
+		expect(manager.getCwd()).toBe(originalCwd);
+	});
+
+	test("continueRecent passes worktreeIsolation to new sessions when no previous session exists", async () => {
+		const fixture = await createWorktreeFixture("omp-worktree-continue-recent-");
+		const sessionDir = path.join(fixture.root, "fresh-sessions");
+		const storage = new FileSessionStorage();
+
+		const manager = await SessionManager.continueRecent(fixture.worktreeRoot, sessionDir, storage, {
+			worktreeIsolation: fixture.isolation,
+		});
+
+		expect(manager.getWorktreeIsolation()).toEqual(fixture.isolation);
+		expect(manager.getHeader()?.worktreeIsolation).toEqual(fixture.isolation);
 	});
 });

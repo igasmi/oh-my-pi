@@ -10,6 +10,7 @@ const COPY_BUFFER_BYTES = 64 * 1024;
 
 export interface WorktreeIncludeResult {
 	readonly copiedPaths: readonly string[];
+	readonly skippedSymlinks: readonly string[];
 }
 
 export class WorktreeIncludeError extends Error {
@@ -19,8 +20,14 @@ export class WorktreeIncludeError extends Error {
 	}
 }
 
-function modeBits(mode: number): number {
-	return mode & 0o777;
+/**
+ * Lexically verify that candidate is within root without calling realpathSync.
+ * Used during the copy walk where canonical roots + per-component lstat walk
+ * already prove no symlink escapes, avoiding expensive synchronous realpath calls in the copy loop.
+ */
+function lexicalPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 async function lstatRequired(target: string, label: string): Promise<fsSync.Stats> {
@@ -31,54 +38,38 @@ async function lstatRequired(target: string, label: string): Promise<fsSync.Stat
 	}
 }
 
-async function assertSafeSourcePath(sourceRoot: string, sourcePath: string, relativePath: string): Promise<void> {
-	const relative = path.relative(sourceRoot, sourcePath);
-	if (
-		sourcePath === sourceRoot ||
-		relative === ".." ||
-		relative.startsWith(`..${path.sep}`) ||
-		path.isAbsolute(relative)
-	) {
-		throw new WorktreeIncludeError(`Refusing .worktreeinclude path outside the source checkout: ${relativePath}`);
-	}
-
-	let current = sourceRoot;
-	for (const component of relative.split(path.sep)) {
-		current = path.join(current, component);
-		const stat = await lstatRequired(current, `Included path ${relativePath}`);
-		if (stat.isSymbolicLink()) {
-			throw new WorktreeIncludeError(`Refusing symlink selected by .worktreeinclude: ${relativePath}`);
-		}
-		if (current !== sourcePath && !stat.isDirectory()) {
-			throw new WorktreeIncludeError(`Included path traverses a non-directory: ${relativePath}`);
-		}
-	}
-
-	const canonicalSource = await fs.realpath(sourcePath);
-	if (!pathIsWithin(sourceRoot, canonicalSource)) {
-		throw new WorktreeIncludeError(`Refusing .worktreeinclude path outside the source checkout: ${relativePath}`);
-	}
-}
-
 async function ensureDestinationDirectory(
 	sourceRoot: string,
 	destinationRoot: string,
 	relativeDirectory: string,
 	createdDirectories: string[],
+	verifiedSourceDirs: Map<string, number>,
+	verifiedDestinationDirs: Set<string>,
 ): Promise<void> {
 	if (!relativeDirectory || relativeDirectory === ".") return;
 
-	let source = sourceRoot;
-	let destination = destinationRoot;
+	let currentRel = "";
 	for (const component of relativeDirectory.split(path.sep)) {
-		source = path.join(source, component);
-		destination = path.join(destination, component);
-		const sourceStat = await lstatRequired(source, `Source directory for ${relativeDirectory}`);
-		if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
-			throw new WorktreeIncludeError(
-				`Refusing unsafe source directory selected by .worktreeinclude: ${relativeDirectory}`,
-			);
+		currentRel = currentRel ? path.join(currentRel, component) : component;
+		const source = path.join(sourceRoot, currentRel);
+		const destination = path.join(destinationRoot, currentRel);
+
+		let sourceMode = verifiedSourceDirs.get(currentRel);
+		if (sourceMode === undefined) {
+			const sourceStat = await lstatRequired(source, `Source directory for ${relativeDirectory}`);
+			if (sourceStat.isSymbolicLink()) {
+				throw new WorktreeIncludeError(`Refusing symlink selected by .worktreeinclude: ${relativeDirectory}`);
+			}
+			if (!sourceStat.isDirectory()) {
+				throw new WorktreeIncludeError(
+					`Refusing unsafe source directory selected by .worktreeinclude: ${relativeDirectory}`,
+				);
+			}
+			sourceMode = sourceStat.mode;
+			verifiedSourceDirs.set(currentRel, sourceMode);
 		}
+
+		if (verifiedDestinationDirs.has(currentRel)) continue;
 
 		try {
 			const destinationStat = await fs.lstat(destination);
@@ -90,9 +81,9 @@ async function ensureDestinationDirectory(
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 			try {
-				await fs.mkdir(destination, { mode: modeBits(sourceStat.mode) });
+				await fs.mkdir(destination, { mode: sourceMode & 0o777 });
 				createdDirectories.push(destination);
-				await fs.chmod(destination, modeBits(sourceStat.mode));
+				await fs.chmod(destination, sourceMode & 0o777);
 			} catch (mkdirError) {
 				if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
 				const destinationStat = await fs.lstat(destination);
@@ -105,12 +96,7 @@ async function ensureDestinationDirectory(
 			}
 		}
 
-		const canonicalDestination = await fs.realpath(destination);
-		if (!pathIsWithin(destinationRoot, canonicalDestination)) {
-			throw new WorktreeIncludeError(
-				`Refusing destination path outside the isolated worktree: ${relativeDirectory}`,
-			);
-		}
+		verifiedDestinationDirs.add(currentRel);
 	}
 }
 
@@ -138,7 +124,7 @@ async function copyRegularFile(
 					fsSync.constants.O_CREAT |
 					fsSync.constants.O_EXCL |
 					fsSync.constants.O_NOFOLLOW,
-				modeBits(sourceStat.mode),
+				sourceStat.mode & 0o777,
 			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -160,7 +146,7 @@ async function copyRegularFile(
 				written += result.bytesWritten;
 			}
 		}
-		await destination.chmod(modeBits(sourceStat.mode));
+		await destination.chmod(sourceStat.mode & 0o777);
 	} catch (error) {
 		if (signal?.aborted) throw error;
 		if (error instanceof WorktreeIncludeError) throw error;
@@ -198,6 +184,7 @@ async function rollbackCopies(
  * Copy ignored, untracked paths selected by the primary checkout's `.worktreeinclude`.
  * Git performs both ignore-rule evaluations; this function only intersects their results
  * and performs a no-follow, no-overwrite copy into the isolated worktree.
+ * Empty ignored directories are not reproduced because git ls-files does not emit directory entries.
  */
 export async function copyWorktreeIncludes(
 	isolation: WorktreeIsolation,
@@ -215,7 +202,7 @@ export async function copyWorktreeIncludes(
 	try {
 		includeStat = await fs.lstat(includePath);
 	} catch (error) {
-		if (isEnoent(error)) return { copiedPaths: [] };
+		if (isEnoent(error)) return { copiedPaths: [], skippedSymlinks: [] };
 		throw new WorktreeIncludeError(`Unable to inspect ${WORKTREE_INCLUDE_FILE}`, { cause: error });
 	}
 	if (includeStat.isSymbolicLink() || !includeStat.isFile()) {
@@ -231,37 +218,65 @@ export async function copyWorktreeIncludes(
 	const createdFiles: string[] = [];
 	const createdDirectories: string[] = [];
 	const copiedPaths: string[] = [];
+	const skippedSymlinks: string[] = [];
 	const buffer = new Uint8Array(COPY_BUFFER_BYTES);
+
+	const verifiedSourceDirs = new Map<string, number>();
+	const verifiedDestinationDirs = new Set<string>();
 
 	try {
 		for (const relativePath of candidates) {
 			signal?.throwIfAborted();
 			const sourcePath = path.resolve(sourceRoot, relativePath);
 			const destinationPath = path.resolve(destinationRoot, relativePath);
-			if (!pathIsWithin(destinationRoot, destinationPath) || destinationPath === destinationRoot) {
+			if (!lexicalPathWithin(sourceRoot, sourcePath) || sourcePath === sourceRoot) {
+				throw new WorktreeIncludeError(
+					`Refusing .worktreeinclude path outside the source checkout: ${relativePath}`,
+				);
+			}
+			if (!lexicalPathWithin(destinationRoot, destinationPath) || destinationPath === destinationRoot) {
 				throw new WorktreeIncludeError(`Refusing .worktreeinclude containment escape: ${relativePath}`);
 			}
-			await assertSafeSourcePath(sourceRoot, sourcePath, relativePath);
-			const sourceStat = await fs.lstat(sourcePath);
 
-			if (sourceStat.isDirectory()) {
-				await ensureDestinationDirectory(
-					sourceRoot,
-					destinationRoot,
-					path.relative(sourceRoot, sourcePath),
-					createdDirectories,
-				);
+			const relative = path.relative(sourceRoot, sourcePath);
+			const components = relative.split(path.sep);
+			const dirComponents = components.slice(0, -1);
+
+			// Verify intermediate directories on source
+			let currentRel = "";
+			for (const component of dirComponents) {
+				currentRel = currentRel ? path.join(currentRel, component) : component;
+				if (!verifiedSourceDirs.has(currentRel)) {
+					const currentPath = path.join(sourceRoot, currentRel);
+					const stat = await lstatRequired(currentPath, `Included path ${relativePath}`);
+					if (stat.isSymbolicLink()) {
+						throw new WorktreeIncludeError(`Refusing symlink selected by .worktreeinclude: ${relativePath}`);
+					}
+					if (!stat.isDirectory()) {
+						throw new WorktreeIncludeError(`Included path traverses a non-directory: ${relativePath}`);
+					}
+					verifiedSourceDirs.set(currentRel, stat.mode);
+				}
+			}
+
+			// Check the final file component on source
+			const sourceStat = await lstatRequired(sourcePath, `Included path ${relativePath}`);
+			if (sourceStat.isSymbolicLink()) {
+				skippedSymlinks.push(relativePath);
 				continue;
 			}
 			if (!sourceStat.isFile()) {
-				throw new WorktreeIncludeError(`Only regular files and directories may be selected: ${relativePath}`);
+				throw new WorktreeIncludeError(`Only regular files may be copied from .worktreeinclude: ${relativePath}`);
 			}
 
+			const relativeDir = path.dirname(relative);
 			await ensureDestinationDirectory(
 				sourceRoot,
 				destinationRoot,
-				path.dirname(path.relative(sourceRoot, sourcePath)),
+				relativeDir === "." ? "" : relativeDir,
 				createdDirectories,
+				verifiedSourceDirs,
+				verifiedDestinationDirs,
 			);
 			await copyRegularFile(sourcePath, destinationPath, relativePath, buffer, createdFiles, signal);
 			copiedPaths.push(relativePath);
@@ -277,5 +292,5 @@ export async function copyWorktreeIncludes(
 		throw error;
 	}
 
-	return { copiedPaths };
+	return { copiedPaths, skippedSymlinks };
 }

@@ -267,6 +267,48 @@ test("real source CLI preserves no-flag cwd inside and outside Git and isolates 
 		expect(await runGit(managed.path, ["branch", "--show-current"])).toBe("worktree-cli-e2e");
 		expect(await runGit(repo, ["branch", "--show-current"])).toBe("main");
 		expect(await Bun.file(path.join(repo, "tracked.txt")).text()).toBe("baseline\n");
+
+		// Persisted launch: the session header must carry the verified isolation
+		// binding — this is the contract that keeps resume/fork validation and
+		// the primary-checkout write guard alive.
+		requests.length = 0;
+		const persistedArgs = commonArgs.filter(arg => arg !== "--no-session");
+		const persisted = await runCli(repo, env, ["-w", "cli-e2e", ...persistedArgs]);
+		expect(persisted.exitCode, persisted.stderr).toBe(0);
+		const sessionFiles: string[] = [];
+		// Session storage may resolve under the agent dir or the XDG data dir
+		// depending on the dirs policy; both live under the fixture root.
+		for await (const file of new Bun.Glob("**/*.jsonl").scan({ cwd: root, absolute: true })) {
+			sessionFiles.push(file);
+		}
+		// The header is not necessarily line 1 (a title slot may precede it), so
+		// scan every line of every session file for the `session` entry.
+		const headers = (
+			await Promise.all(
+				sessionFiles.map(async file =>
+					(await Bun.file(file).text()).split("\n").map(line => {
+						try {
+							return JSON.parse(line) as {
+								type?: string;
+								cwd?: string;
+								worktreeIsolation?: { worktreeRoot: string; primaryRoot: string; branch: string };
+							};
+						} catch {
+							return null;
+						}
+					}),
+				),
+			)
+		).flat();
+		const bound = headers.find(header => header?.type === "session" && header.worktreeIsolation);
+		expect(bound?.worktreeIsolation).toBeDefined();
+		if (!bound?.worktreeIsolation) throw new Error("No session header carried a worktree isolation binding");
+		expect(normalizePathForComparison(bound.worktreeIsolation.worktreeRoot)).toBe(
+			normalizePathForComparison(managed.path),
+		);
+		expect(normalizePathForComparison(bound.worktreeIsolation.primaryRoot)).toBe(normalizePathForComparison(repo));
+		expect(bound.worktreeIsolation.branch).toBe("worktree-cli-e2e");
+		expect(normalizePathForComparison(bound.cwd ?? "")).toBe(normalizePathForComparison(managed.path));
 	} finally {
 		try {
 			if (server) await server.stop(true);

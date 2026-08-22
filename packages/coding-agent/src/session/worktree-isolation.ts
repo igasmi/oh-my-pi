@@ -1,7 +1,20 @@
-import type * as fsTypes from "node:fs";
+/**
+ * Accident-prevention guardrails for isolated linked git worktrees.
+ *
+ * This is an ACCIDENT GUARDRAIL, NOT a security boundary — arbitrary process
+ * execution (e.g. bash commands) can still mutate the primary checkout.
+ *
+ * Enforced surfaces:
+ * - Session-header validation on resume and fork (`validateWorktreeIsolation`)
+ * - Additional-directory filtering (`filterWorktreeAdditionalDirectories`)
+ * - First-party write/edit tool guard: the synchronous boundary check in
+ *   `tools/plan-mode-guard.ts` (`enforceWriteGuards`), which resolves targets
+ *   through their nearest existing ancestor before containment testing.
+ */
+
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, normalizePathForComparison } from "@oh-my-pi/pi-utils";
+import { isEnoent, lexicalPathIsWithin, lstatOptional, normalizePathForComparison, samePath } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
 
 /** Persisted identity and authorization boundary for an isolated linked worktree. */
@@ -16,8 +29,6 @@ export interface WorktreeIsolation {
 	branch: string;
 	/** Canonical absolute path to the repository's shared Git directory. */
 	commonDir: string;
-	/** Whether OMP owns the worktree's storage lifecycle. */
-	managed?: boolean;
 }
 
 export type WorktreeIsolationValidationResult =
@@ -38,26 +49,6 @@ export class WorktreeIsolationError extends Error {
 	}
 }
 
-export type WorktreePathKind = "worktree" | "primary" | "additional" | "outside" | "unverifiable";
-
-export interface WorktreePathClassification {
-	kind: WorktreePathKind;
-	canonicalPath?: string;
-}
-
-export interface WorktreePathClassificationOptions {
-	/** Base for a relative target. Defaults to the isolated worktree root. */
-	baseDir?: string;
-	/** Follow the final path component when it is a symlink. Defaults to true. */
-	followFinal?: boolean;
-	/** Already-authorized workspace roots. Primary-checkout paths still take precedence. */
-	additionalDirectories?: readonly string[];
-}
-
-function samePath(left: string, right: string): boolean {
-	return normalizePathForComparison(left) === normalizePathForComparison(right);
-}
-
 function sameCanonicalPath(left: string, right: string): boolean {
 	const resolvedLeft = path.resolve(left);
 	const resolvedRight = path.resolve(right);
@@ -66,40 +57,28 @@ function sameCanonicalPath(left: string, right: string): boolean {
 		: resolvedLeft === resolvedRight;
 }
 
+/**
+ * Lexical containment check for pre-canonicalized paths (deliberately no realpath / disk I/O).
+ */
 function canonicalPathIsWithin(root: string, candidate: string): boolean {
-	const resolvedRoot = path.resolve(root);
-	const resolvedCandidate = path.resolve(candidate);
-	const comparisonRoot = process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot;
-	const comparisonCandidate = process.platform === "win32" ? resolvedCandidate.toLowerCase() : resolvedCandidate;
-	const relative = path.relative(comparisonRoot, comparisonCandidate);
-	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+	return lexicalPathIsWithin(root, candidate);
 }
 
-function hasValidShape(isolation: WorktreeIsolation): boolean {
+function hasValidShape(isolation: unknown): isolation is WorktreeIsolation {
+	if (isolation === null || typeof isolation !== "object") return false;
+	const candidate = isolation as Record<string, unknown>;
 	return (
-		isolation !== null &&
-		typeof isolation === "object" &&
-		typeof isolation.worktreeRoot === "string" &&
-		path.isAbsolute(isolation.worktreeRoot) &&
-		typeof isolation.primaryRoot === "string" &&
-		path.isAbsolute(isolation.primaryRoot) &&
-		typeof isolation.name === "string" &&
-		isolation.name.length > 0 &&
-		typeof isolation.branch === "string" &&
-		isolation.branch.length > 0 &&
-		typeof isolation.commonDir === "string" &&
-		path.isAbsolute(isolation.commonDir) &&
-		(isolation.managed === undefined || typeof isolation.managed === "boolean")
+		typeof candidate.worktreeRoot === "string" &&
+		path.isAbsolute(candidate.worktreeRoot) &&
+		typeof candidate.primaryRoot === "string" &&
+		path.isAbsolute(candidate.primaryRoot) &&
+		typeof candidate.name === "string" &&
+		candidate.name.length > 0 &&
+		typeof candidate.branch === "string" &&
+		candidate.branch.length > 0 &&
+		typeof candidate.commonDir === "string" &&
+		path.isAbsolute(candidate.commonDir)
 	);
-}
-
-async function lstatOptional(filePath: string): Promise<fsTypes.Stats | null> {
-	try {
-		return await fs.lstat(filePath);
-	} catch (error) {
-		if (isEnoent(error)) return null;
-		throw error;
-	}
 }
 
 /**
@@ -107,9 +86,7 @@ async function lstatOptional(filePath: string): Promise<fsTypes.Stats | null> {
  * Missing checkouts are reported separately; every malformed or inconsistent
  * binding is treated as tampering.
  */
-export async function validateWorktreeIsolation(
-	isolation: WorktreeIsolation,
-): Promise<WorktreeIsolationValidationResult> {
+export async function validateWorktreeIsolation(isolation: unknown): Promise<WorktreeIsolationValidationResult> {
 	if (!hasValidShape(isolation)) {
 		return { status: "tampered", reason: "Worktree isolation metadata is malformed." };
 	}
@@ -125,10 +102,11 @@ export async function validateWorktreeIsolation(
 		if (!primaryStat) {
 			return { status: "missing", reason: `Primary checkout is missing: ${isolation.primaryRoot}` };
 		}
-		if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink()) {
+		// lstat does not follow symlinks, so symlinks fail isDirectory()
+		if (!worktreeStat.isDirectory()) {
 			return { status: "tampered", reason: "Isolated worktree root is not a real directory." };
 		}
-		if (!primaryStat.isDirectory() || primaryStat.isSymbolicLink()) {
+		if (!primaryStat.isDirectory()) {
 			return { status: "tampered", reason: "Primary checkout root is not a real directory." };
 		}
 
@@ -148,7 +126,8 @@ export async function validateWorktreeIsolation(
 		if (!canonicalCommonDir || !sameCanonicalPath(isolation.commonDir, canonicalCommonDir)) {
 			return { status: "tampered", reason: "Recorded Git common directory is missing or not canonical." };
 		}
-		if (!gitEntryStat?.isFile() || gitEntryStat.isSymbolicLink()) {
+		// lstat does not follow symlinks, so symlinks fail isFile()
+		if (!gitEntryStat?.isFile()) {
 			return { status: "tampered", reason: "Linked worktree .git metadata is missing or unsafe." };
 		}
 
@@ -192,7 +171,6 @@ export async function validateWorktreeIsolation(
 				name: isolation.name,
 				branch: isolation.branch,
 				commonDir: canonicalCommonDir,
-				...(isolation.managed === undefined ? {} : { managed: isolation.managed }),
 			},
 		};
 	} catch (error) {
@@ -201,55 +179,6 @@ export async function validateWorktreeIsolation(
 			reason: error instanceof Error ? error.message : "Worktree isolation verification failed.",
 		};
 	}
-}
-
-async function canonicalizePath(targetPath: string, baseDir: string, followFinal: boolean): Promise<string | null> {
-	const absolutePath = path.resolve(baseDir, targetPath);
-	const pathToResolve = followFinal ? absolutePath : path.dirname(absolutePath);
-	const unresolved: string[] = followFinal ? [] : [path.basename(absolutePath)];
-	let cursor = pathToResolve;
-
-	while (true) {
-		try {
-			const canonicalAncestor = await fs.realpath(cursor);
-			return path.resolve(canonicalAncestor, ...unresolved.reverse());
-		} catch (error) {
-			if (!isEnoent(error)) return null;
-			const parent = path.dirname(cursor);
-			if (parent === cursor) return null;
-			unresolved.push(path.basename(cursor));
-			cursor = parent;
-		}
-	}
-}
-
-/** Classify a mutation path after resolving symlinked ancestors and existing targets. */
-export async function classifyWorktreePath(
-	isolation: WorktreeIsolation,
-	targetPath: string,
-	options: WorktreePathClassificationOptions = {},
-): Promise<WorktreePathClassification> {
-	if (!hasValidShape(isolation) || typeof targetPath !== "string" || targetPath.length === 0) {
-		return { kind: "unverifiable" };
-	}
-	const canonicalPath = await canonicalizePath(
-		targetPath,
-		options.baseDir ?? isolation.worktreeRoot,
-		options.followFinal ?? true,
-	);
-	if (!canonicalPath) return { kind: "unverifiable" };
-
-	if (canonicalPathIsWithin(isolation.worktreeRoot, canonicalPath)) return { kind: "worktree", canonicalPath };
-	// The protected primary checkout always wins over additional-directory authorization.
-	if (canonicalPathIsWithin(isolation.primaryRoot, canonicalPath)) return { kind: "primary", canonicalPath };
-
-	for (const directory of options.additionalDirectories ?? []) {
-		const canonicalDirectory = await canonicalizePath(directory, options.baseDir ?? isolation.worktreeRoot, true);
-		if (canonicalDirectory && canonicalPathIsWithin(canonicalDirectory, canonicalPath)) {
-			return { kind: "additional", canonicalPath };
-		}
-	}
-	return { kind: "outside", canonicalPath };
 }
 
 /**
@@ -267,7 +196,8 @@ export async function filterWorktreeAdditionalDirectories(
 		if (typeof directory !== "string" || directory.length === 0) continue;
 		const absoluteDirectory = path.resolve(isolation.worktreeRoot, directory);
 		const stat = await lstatOptional(absoluteDirectory).catch(() => null);
-		if (!stat?.isDirectory() || stat.isSymbolicLink()) continue;
+		// lstat does not follow symlinks, so symlinks fail isDirectory()
+		if (!stat?.isDirectory()) continue;
 		const canonicalDirectory = await fs.realpath(absoluteDirectory).catch(() => null);
 		// Reject aliases through any symlinked path component instead of silently
 		// widening authorization to a different on-disk location.
@@ -280,23 +210,4 @@ export async function filterWorktreeAdditionalDirectories(
 		filtered.push(canonicalDirectory);
 	}
 	return filtered;
-}
-
-/** Resolve and authorize a mutation target, returning its canonical syscall path. */
-export async function assertWorktreeMutationAllowed(
-	isolation: WorktreeIsolation,
-	targetPath: string,
-	options: WorktreePathClassificationOptions = {},
-): Promise<string> {
-	const classification = await classifyWorktreePath(isolation, targetPath, options);
-	if (classification.kind === "primary") {
-		throw new WorktreeIsolationError(
-			`Worktree isolation blocks mutations in the primary checkout: ${classification.canonicalPath}`,
-			"primary",
-		);
-	}
-	if (classification.kind === "unverifiable" || !classification.canonicalPath) {
-		throw new WorktreeIsolationError(`Cannot safely resolve mutation path: ${targetPath}`, "unverifiable");
-	}
-	return classification.canonicalPath;
 }

@@ -57,7 +57,7 @@ import {
 	probeLiteralPathExists,
 	splitPathAndSel,
 } from "./path-utils";
-import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
+import { enforceWriteGuards, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
 	createRenderedStringCache,
@@ -1129,7 +1129,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					// Handler-owned writes mutate user data outside the local
 					// sandbox. xd:// dispatches retain each wrapped tool's tier.
 					if (scheme !== "xd") {
-						enforcePlanModeWrite(this.session, path, { op: "update" });
+						enforceWriteGuards(this.session, path, { op: "update" });
 						emitWriteProgress(onUpdate, cleanContent, path);
 					}
 					let xdResult: AgentToolResult<WriteToolDetails> | undefined;
@@ -1220,7 +1220,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 			const resolvedArchivePath = await this.#resolveArchiveWritePath(path);
 			if (resolvedArchivePath) {
-				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
+				enforceWriteGuards(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
 
@@ -1247,7 +1247,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
 			if (resolvedSqlitePath) {
-				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
+				enforceWriteGuards(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
 				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
@@ -1264,7 +1264,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 
 			await assertNotReadSelectorMisfire(path, cleanContent, this.session.cwd);
-			enforcePlanModeWrite(this.session, path, { op: "create" });
+			enforceWriteGuards(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 

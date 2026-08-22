@@ -125,13 +125,50 @@ export function resolvePlanPath(session: ToolSession, targetPath: string): strin
 	return resolveToCwd(normalized, session.cwd);
 }
 
+/** Canonicalize via the nearest existing ancestor so not-yet-created targets
+ *  (`write` creating parents) still resolve symlinked prefixes. */
+function canonicalizeExistingPrefix(absolute: string): string {
+	let base = absolute;
+	const suffix: string[] = [];
+	for (;;) {
+		try {
+			const real = fs.realpathSync.native(base);
+			return suffix.length === 0 ? real : path.join(real, ...suffix.reverse());
+		} catch {
+			const parent = path.dirname(base);
+			if (parent === base) return absolute;
+			suffix.push(path.basename(base));
+			base = parent;
+		}
+	}
+}
+
 /**
- * Plan mode keeps the working tree read-only while letting the agent draft its
- * plan. Writes and edits to the `local://` artifact sandbox are allowed (that is
- * where the plan and any scratch notes live); anything that would touch the
- * working tree — or rename/delete a file — is rejected.
+ * Worktree sessions refuse first-party writes into the primary checkout. This
+ * is an accident guardrail, not a sandbox — process execution (`bash`, eval)
+ * is deliberately out of scope; see session/worktree-isolation.ts.
  */
-export function enforcePlanModeWrite(
+function enforceWorktreeBoundary(session: ToolSession, targetPath: string): void {
+	const isolation = session.getWorktreeWriteGuard?.() ?? session.getWorktreeIsolation?.();
+	if (!isolation) return;
+	let resolved: string;
+	try {
+		resolved = resolvePlanPath(session, targetPath);
+	} catch {
+		return; // Unresolvable targets fail with the write's own error.
+	}
+	if (!path.isAbsolute(resolved)) return;
+	// Binding roots are canonical by the validateWorktreeIsolation contract.
+	const absolute = canonicalizeExistingPrefix(path.resolve(resolved));
+	if (isWithinRoot(absolute, isolation.worktreeRoot)) return;
+	if (isWithinRoot(absolute, isolation.primaryRoot)) {
+		throw new ToolError(
+			`Worktree isolation: refusing to modify the primary checkout (${targetPath}). This session works in ${isolation.worktreeRoot}; make the change there instead.`,
+		);
+	}
+}
+
+function enforcePlanMode(
 	session: ToolSession,
 	targetPath: string,
 	options?: { move?: string; op?: "create" | "update" | "delete" },
@@ -152,4 +189,19 @@ export function enforcePlanModeWrite(
 	throw new ToolError(
 		"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.",
 	);
+}
+
+/**
+ * Shared write-policy gate for every first-party mutating tool path. Enforces
+ * plan-mode read-only rules and, in worktree sessions, the primary-checkout
+ * guardrail (including `move` destinations).
+ */
+export function enforceWriteGuards(
+	session: ToolSession,
+	targetPath: string,
+	options?: { move?: string; op?: "create" | "update" | "delete" },
+): void {
+	enforcePlanMode(session, targetPath, options);
+	enforceWorktreeBoundary(session, targetPath);
+	if (options?.move) enforceWorktreeBoundary(session, options.move);
 }

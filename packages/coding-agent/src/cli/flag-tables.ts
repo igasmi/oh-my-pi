@@ -74,8 +74,9 @@ export type OptionalSetter = (result: Args, value: string | undefined) => void;
 export interface OptionalFlagConfig {
 	set: OptionalSetter;
 	rejectEmpty?: boolean;
-	/** Treat a present empty token as an invalid value instead of the bare form. */
-	errorOnEmpty?: boolean;
+	/** When set, a present-but-empty token is a usage error with this message
+	 *  instead of being treated as the bare (valueless) form. */
+	emptyValueError?: string;
 }
 
 // Shared setters for flags that alias the same field.
@@ -248,12 +249,14 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
  * check for every flag, then consults the per-flag booleans below for the
  * remaining quirks.
  */
+const EMPTY_WORKTREE_NAME_ERROR = `Invalid worktree name "": provide a non-empty name or omit it to generate one.`;
+
 export const OPTIONAL_FLAGS: Record<string, OptionalFlagConfig> = {
 	"--resume": { set: setResume, rejectEmpty: true },
 	"-r": { set: setResume, rejectEmpty: true },
 	"--session": { set: setResume, rejectEmpty: true },
-	"--worktree": { set: setWorktree, rejectEmpty: true, errorOnEmpty: true },
-	"-w": { set: setWorktree, rejectEmpty: true, errorOnEmpty: true },
+	"--worktree": { set: setWorktree, rejectEmpty: true, emptyValueError: EMPTY_WORKTREE_NAME_ERROR },
+	"-w": { set: setWorktree, rejectEmpty: true, emptyValueError: EMPTY_WORKTREE_NAME_ERROR },
 };
 
 /**

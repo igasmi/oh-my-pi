@@ -20,13 +20,18 @@ function createTrackedWorktree(releaseGate: Promise<void> = Promise.resolve()): 
 } {
 	const state = { locked: true, registered: true, releaseCalls: 0 };
 	const releaseStarted = Promise.withResolvers<void>();
+	// Mirror the applyStartupWorktree contract: `path`, `isolation.worktreeRoot`,
+	// and the session cwd are the same directory. The binding is live — session
+	// creation rejects a cwd/worktreeRoot mismatch — so the fake must use a real
+	// directory (the test process cwd) rather than a synthetic path.
+	const worktreeRoot = process.cwd();
 	return {
 		worktree: {
 			name: "lifecycle-test",
 			branch: "lifecycle-test",
-			path: path.join(process.cwd(), ".lifecycle-test-worktree"),
+			path: worktreeRoot,
 			isolation: {
-				worktreeRoot: "/synthetic/lifecycle-test-worktree",
+				worktreeRoot,
 				primaryRoot: "/synthetic/primary-checkout",
 				name: "lifecycle-test",
 				branch: "lifecycle-test",
@@ -47,7 +52,11 @@ function createTrackedWorktree(releaseGate: Promise<void> = Promise.resolve()): 
 }
 
 function createParsedArgs(extraArgs: string[] = []) {
-	const parsed = parseArgs(["-w", "lifecycle-test", "--print", ...extraArgs]);
+	// --no-session: these tests cover lock/release lifecycle only. A persisted
+	// session would eagerly create a manager in the REAL default session dir
+	// (binding present, no --session-dir) and leak a process-global artifacts
+	// registration into later test files.
+	const parsed = parseArgs(["-w", "lifecycle-test", "--print", "--no-session", ...extraArgs]);
 	parsed.noExtensions = true;
 	parsed.noSkills = true;
 	parsed.noRules = true;

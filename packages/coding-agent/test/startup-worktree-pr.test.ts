@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { applyStartupWorktree } from "@oh-my-pi/pi-coding-agent/cli/startup-worktree";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { fetchPullRequest, parsePullRequestSelector } from "@oh-my-pi/pi-coding-agent/worktree/pr-selector";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getProjectDir, getWorktreesDir, removeWithRetries, setProjectDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 
 const tempRoots: string[] = [];
 
@@ -149,5 +151,39 @@ describe("pull request selectors", () => {
 		if (!selector) throw new Error("Expected #5 to parse as a pull request selector");
 
 		await expect(fetchPullRequest(repo, selector)).rejects.toThrow(/repository has no origin remote/);
+	});
+});
+
+describe("-w pull request selector integration", () => {
+	test("checks out the request head into a pr-<n> worktree pinned at the fetched commit", async () => {
+		const fixture = await createRemoteFixture();
+		const commit = await publishRequestCommit(fixture.repo, fixture.bareRemote, "refs/pull/7/head");
+		// Rewind local main so the request head differs from both HEAD and the
+		// remote default — proving the branch is pinned to the fetched commit.
+		await runGit(fixture.repo, ["reset", "--hard", "HEAD~1"]);
+
+		const managed = path.join(fixture.root, "managed-worktrees");
+		const previousProjectDir = getProjectDir();
+		const previousWorktreesDir = getWorktreesDir();
+		try {
+			setProjectDir(fixture.repo);
+			setWorktreesDir(managed);
+			const parsed = parseArgs(["-w", "#7"]);
+			const worktree = await applyStartupWorktree(parsed);
+			expect(worktree).not.toBeNull();
+			if (!worktree) throw new Error("applyStartupWorktree returned null for -w '#7'");
+			try {
+				expect(worktree.name).toBe("pr-7");
+				expect(worktree.branch).toBe("worktree-pr-7");
+				expect(parsed.cwd).toBe(worktree.path);
+				expect(await runGit(worktree.path, ["rev-parse", "HEAD"])).toBe(commit);
+				expect(await git.branch.current(worktree.path)).toBe("worktree-pr-7");
+			} finally {
+				await worktree.release();
+			}
+		} finally {
+			setProjectDir(previousProjectDir);
+			setWorktreesDir(previousWorktreesDir);
+		}
 	});
 });
