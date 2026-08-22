@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- `omp -w '#123'` (or a GitHub/GitLab request URL) now checks out that pull request into the isolated worktree.
+- `.worktreeinclude` patterns now copy matching ignored files (e.g. `.env`) into new `omp -w` worktrees; symlinked entries are skipped.
+- Worktree sessions now refuse file-tool writes into the primary checkout and ignore `--add-dir` entries that point inside it.
+
+### Changed
+
+- `omp worktree clear`/`remove` now skip worktrees owned by a live omp session, including `--all`, and take a cross-process lock so removal cannot race a concurrent `omp -w` launch.
+- Faster `omp worktree remove` safety check (single ref-containment query instead of one per ref).
+
+### Fixed
+
+- `omp -w` sessions now persist their worktree binding in the session header, so resuming a deleted or tampered worktree fails with a clear error instead of continuing silently.
+- Worktree commands now work on git older than 2.36.
+- A contended worktree launch now reports that another omp process is preparing the repository instead of an internal lock error.
+
 ## [18.0.0] - 2026-08-22
 
 ### Added
