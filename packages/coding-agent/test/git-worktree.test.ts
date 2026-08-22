@@ -51,6 +51,7 @@ describe("git branch and worktree primitives", () => {
 	});
 
 	afterEach(async () => {
+		git._resetGitVersionForTesting();
 		await fs.rm(tempRoot, { force: true, maxRetries: 5, recursive: true, retryDelay: 50 });
 	});
 
@@ -98,4 +99,136 @@ describe("git branch and worktree primitives", () => {
 			expect(await fs.readFile(path.join(target, "tracked.txt"), "utf8")).toBe("baseline\n");
 		},
 	);
+
+	it("parses newline porcelain format with branches, detached, bare locks, reasons, and prunables", () => {
+		const fixture = [
+			"worktree /repo/main",
+			"HEAD 1111111111111111111111111111111111111111",
+			"branch refs/heads/main",
+			"",
+			"worktree /repo/detached",
+			"HEAD 2222222222222222222222222222222222222222",
+			"detached",
+			"",
+			"worktree /repo/locked-bare",
+			"HEAD 3333333333333333333333333333333333333333",
+			"branch refs/heads/locked-bare",
+			"locked",
+			"",
+			"worktree /repo/locked-with-reason",
+			"HEAD 4444444444444444444444444444444444444444",
+			"branch refs/heads/locked-with-reason",
+			"locked omp startup isolation",
+			"",
+			"worktree /repo/prunable",
+			"HEAD 5555555555555555555555555555555555555555",
+			"detached",
+			"prunable gitdir file points to non-existent location",
+			"",
+			'worktree "/repo/quoted\\tpath\\nwith\\"special"',
+			"HEAD 6666666666666666666666666666666666666666",
+			"branch refs/heads/feature",
+			"",
+		].join("\n");
+
+		const entries = git.parseWorktreeListNewline(fixture);
+		expect(entries).toEqual([
+			{
+				path: "/repo/main",
+				head: "1111111111111111111111111111111111111111",
+				branch: "refs/heads/main",
+				detached: false,
+			},
+			{
+				path: "/repo/detached",
+				head: "2222222222222222222222222222222222222222",
+				detached: true,
+			},
+			{
+				path: "/repo/locked-bare",
+				head: "3333333333333333333333333333333333333333",
+				branch: "refs/heads/locked-bare",
+				detached: false,
+				locked: "",
+			},
+			{
+				path: "/repo/locked-with-reason",
+				head: "4444444444444444444444444444444444444444",
+				branch: "refs/heads/locked-with-reason",
+				detached: false,
+				locked: "omp startup isolation",
+			},
+			{
+				path: "/repo/prunable",
+				head: "5555555555555555555555555555555555555555",
+				detached: true,
+			},
+			{
+				path: '/repo/quoted\tpath\nwith"special',
+				head: "6666666666666666666666666666666666666666",
+				branch: "refs/heads/feature",
+				detached: false,
+			},
+		]);
+	});
+
+	it("checks if refs contain a commit with ref.containsCommit", async () => {
+		const baseSha = runGit(repoRoot, ["rev-parse", "HEAD"]).trim();
+
+		// Create a second branch with a new commit
+		runGit(repoRoot, ["checkout", "-b", "feature"]);
+		await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature content\n");
+		runGit(repoRoot, ["add", "feature.txt"]);
+		runGit(repoRoot, [
+			"-c",
+			"user.name=test",
+			"-c",
+			"user.email=test@test.local",
+			"-c",
+			"commit.gpgsign=false",
+			"commit",
+			"-m",
+			"feature commit",
+		]);
+		const featureSha = runGit(repoRoot, ["rev-parse", "HEAD"]).trim();
+
+		// Base commit is contained in both main and feature refs
+		expect(await git.ref.containsCommit(repoRoot, baseSha)).toBe(true);
+		expect(await git.ref.containsCommit(repoRoot, baseSha, { excludeRef: "refs/heads/feature" })).toBe(true);
+
+		// Feature commit is contained only in refs/heads/feature
+		expect(await git.ref.containsCommit(repoRoot, featureSha)).toBe(true);
+		expect(await git.ref.containsCommit(repoRoot, featureSha, { excludeRef: "refs/heads/feature" })).toBe(false);
+
+		// Non-existent commit returns false
+		expect(await git.ref.containsCommit(repoRoot, "0000000000000000000000000000000000000000")).toBe(false);
+	});
+
+	it("parses and compares git versions", () => {
+		expect(git.parseGitVersion("git version 2.39.3")).toEqual({ major: 2, minor: 39, patch: 3 });
+		expect(git.parseGitVersion("git version 2.34.1.windows.1")).toEqual({ major: 2, minor: 34, patch: 1 });
+		expect(git.parseGitVersion("git version 2.36.0 (Apple Git-146)")).toEqual({ major: 2, minor: 36, patch: 0 });
+		expect(git.parseGitVersion("not git")).toBeNull();
+
+		expect(git.isGitVersionAtLeast({ major: 2, minor: 36, patch: 0 }, 2, 36)).toBe(true);
+		expect(git.isGitVersionAtLeast({ major: 2, minor: 35, patch: 9 }, 2, 36)).toBe(false);
+		expect(git.isGitVersionAtLeast({ major: 3, minor: 0, patch: 0 }, 2, 36)).toBe(true);
+		expect(git.isGitVersionAtLeast(null, 2, 36)).toBe(false);
+	});
+
+	it("creates a locked detached worktree on simulated git < 2.36 using two-step add and lock fallback", async () => {
+		git._setGitVersionForTesting({ major: 2, minor: 35, patch: 0 });
+		const target = path.join(tempRoot, "old-git-worktree");
+		const reason = "old git lock reason";
+
+		await git.worktree.add(repoRoot, target, "HEAD", { detach: true, lockReason: reason });
+
+		const entries = await git.worktree.list(repoRoot);
+		const entry = entries.find(
+			candidate => normalizePathForComparison(candidate.path) === normalizePathForComparison(target),
+		);
+		expect(entry).toBeDefined();
+		expect(entry).toMatchObject({ detached: true, locked: reason });
+		expect(await fs.readFile(path.join(target, "tracked.txt"), "utf8")).toBe("baseline\n");
+	});
 });
