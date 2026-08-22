@@ -19,8 +19,9 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getWorktreesDir, hashPath, isEnoent, normalizePathForComparison } from "@oh-my-pi/pi-utils";
+import { getWorktreesDir, hashPath, isEnoent, samePath } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { FileLockContentionError, withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import {
 	hasLiveIsolationOwner,
 	ISOLATION_OWNER_FILE,
@@ -28,6 +29,7 @@ import {
 	type ProcessOwner,
 } from "../task/isolation-ownership";
 import * as git from "../utils/git";
+import { readLiveSessionWorktreeOwner, removeSessionWorktreeOwner } from "./session-worktree-owner";
 
 type WorktreeKind = "pr-checkout" | "session" | "task-isolation" | "empty" | "stray";
 
@@ -62,7 +64,7 @@ export interface ListWorktreesOptions {
 }
 
 export interface ClearWorktreesOptions {
-	/** Remove every entry, including live PR-checkout worktrees. */
+	/** Remove every entry except active sessions with a live owner or lock. */
 	all: boolean;
 	/** Print what would be removed without touching the filesystem. */
 	dryRun: boolean;
@@ -121,11 +123,58 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
 
 export async function clearWorktrees(options: ClearWorktreesOptions): Promise<void> {
 	const { entries, root } = await scanWorktrees();
-	const targets = options.all ? entries : entries.filter(entry => entry.orphanReason !== undefined);
+	if (!root) {
+		if (options.json) {
+			console.log(JSON.stringify(options.dryRun ? { wouldRemove: [] } : { removed: 0, kept: 0 }));
+		} else {
+			console.log(chalk.dim(options.all ? "No worktrees to remove." : "No orphaned worktrees to remove."));
+		}
+		return;
+	}
+
+	const candidates = options.all ? entries : entries.filter(entry => entry.orphanReason !== undefined);
+	const targets: WorktreeEntry[] = [];
+	const skipped: { path: string; message: string }[] = [];
+
+	for (const candidate of candidates) {
+		const liveOwner = await readLiveSessionWorktreeOwner(candidate.path);
+		if (liveOwner) {
+			skipped.push({
+				path: candidate.path,
+				message: `active session "${liveOwner.name}", pid ${liveOwner.pid}`,
+			});
+			continue;
+		}
+		if (candidate.parentRepo) {
+			const list = await git.worktree.list(candidate.parentRepo).catch(() => []);
+			const reg = list.find(entry => samePath(entry.path, candidate.path));
+			if (reg?.locked !== undefined) {
+				const lockName = worktreeLogicalName(candidate);
+				const lockState = await classifyWorktreeLock(reg.locked, lockName);
+				if (lockState === "exact-live") {
+					skipped.push({
+						path: candidate.path,
+						message: "locked by live session",
+					});
+					continue;
+				}
+			}
+		}
+		targets.push(candidate);
+	}
+
+	if (!options.json) {
+		for (const s of skipped) {
+			console.log(`${chalk.yellow("skipped")}  ${s.path} (${s.message})`);
+		}
+	}
 
 	if (targets.length === 0) {
+		if (!options.dryRun) {
+			await sweepOrphanedOwnerFiles(root.path);
+		}
 		if (options.json) {
-			console.log(JSON.stringify({ removed: 0, kept: entries.length }));
+			console.log(JSON.stringify(options.dryRun ? { wouldRemove: [] } : { removed: 0, kept: entries.length }));
 		} else {
 			console.log(chalk.dim(options.all ? "No worktrees to remove." : "No orphaned worktrees to remove."));
 		}
@@ -146,32 +195,88 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 
 	const results: { path: string; ok: boolean; error?: string }[] = [];
 	const parentsToPrune = new Set<string>();
-	if (!root) throw new Error("Managed worktree root disappeared before removal.");
 	for (const target of targets) {
 		try {
-			if (
-				(target.kind === "pr-checkout" || target.kind === "session") &&
-				target.parentRepo &&
-				!target.orphanReason
-			) {
-				// This branch is reachable only for explicit `--all`. Release a git
-				// lock first so removal also clears its metadata; pruning deliberately
-				// preserves locked entries. An unlocked worktree simply returns false.
+			if (target.parentRepo) {
 				await assertSafeManagedDirectory(root, target.path);
-				await git.worktree.tryUnlock(target.parentRepo, target.path);
-				await assertSafeManagedDirectory(root, target.path);
-				const removed = await git.worktree.tryRemove(target.parentRepo, target.path, { force: true });
-				if (!removed) {
-					await assertSafeManagedDirectory(root, target.path);
-					await fs.rm(target.path, { recursive: true, force: true });
-					parentsToPrune.add(target.parentRepo);
+				const primaryRepo = (await git.repo.primaryRoot(target.parentRepo).catch(() => null)) ?? target.parentRepo;
+				const canonicalPrimary = await fs.realpath(primaryRepo).catch(() => primaryRepo);
+				const repoLockTarget = path.join(root.canonicalPath, `.session-${hashPath(canonicalPrimary)}`);
+				let skippedInLock = false;
+				try {
+					await withFileLock(
+						repoLockTarget,
+						() =>
+							git.withRepoLock(target.parentRepo!, async () => {
+								await assertSafeManagedDirectory(root, target.path);
+								const liveOwner = await readLiveSessionWorktreeOwner(target.path);
+								if (liveOwner) {
+									skippedInLock = true;
+									if (!options.json) {
+										console.log(
+											`${chalk.yellow("skipped")}  ${target.path} (active session "${liveOwner.name}", pid ${liveOwner.pid})`,
+										);
+									}
+									return;
+								}
+								const list = await git.worktree.list(target.parentRepo!).catch(() => []);
+								const reg = list.find(entry => samePath(entry.path, target.path));
+								if (reg?.locked !== undefined) {
+									const lockName = worktreeLogicalName(target);
+									const lockState = await classifyWorktreeLock(reg.locked, lockName);
+									if (lockState === "exact-live") {
+										skippedInLock = true;
+										if (!options.json) {
+											console.log(`${chalk.yellow("skipped")}  ${target.path} (locked by live session)`);
+										}
+										return;
+									}
+								}
+								if (!target.orphanReason) {
+									await git.worktree.tryUnlock(target.parentRepo!, target.path);
+									await assertSafeManagedDirectory(root, target.path);
+									const removed = await git.worktree.tryRemove(target.parentRepo!, target.path, {
+										force: true,
+									});
+									if (!removed) {
+										await assertSafeManagedDirectory(root, target.path);
+										await fs.rm(target.path, { recursive: true, force: true });
+										parentsToPrune.add(target.parentRepo!);
+									}
+								} else {
+									await fs.rm(target.path, { recursive: true, force: true });
+									parentsToPrune.add(target.parentRepo!);
+								}
+								await removeSessionWorktreeOwner(target.path);
+							}),
+						{ retries: 40, retryDelayMs: 50 },
+					);
+				} catch (err) {
+					if (err instanceof FileLockContentionError) {
+						throw new Error(
+							"Could not acquire worktree lock due to a concurrent omp launch or removal; retry the command.",
+						);
+					}
+					throw err;
+				}
+				if (!skippedInLock) {
+					results.push({ path: target.path, ok: true });
 				}
 			} else {
+				const liveOwner = await readLiveSessionWorktreeOwner(target.path);
+				if (liveOwner) {
+					if (!options.json) {
+						console.log(
+							`${chalk.yellow("skipped")}  ${target.path} (active session "${liveOwner.name}", pid ${liveOwner.pid})`,
+						);
+					}
+					continue;
+				}
 				await assertSafeManagedDirectory(root, target.path);
 				await fs.rm(target.path, { recursive: true, force: true });
-				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
+				await removeSessionWorktreeOwner(target.path);
+				results.push({ path: target.path, ok: true });
 			}
-			results.push({ path: target.path, ok: true });
 		} catch (err) {
 			results.push({ path: target.path, ok: false, error: err instanceof Error ? err.message : String(err) });
 		}
@@ -185,6 +290,8 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 			/* parent repo may already be gone or pruned — ignore */
 		}
 	}
+
+	await sweepOrphanedOwnerFiles(root.path);
 
 	const succeeded = results.filter(r => r.ok).length;
 	const failed = results.length - succeeded;
@@ -323,116 +430,156 @@ async function removeResolvedWorktree(
 		return removalFailure(target, "refused", "The target is not a registered git worktree.", entry, name);
 	}
 
-	return git.withRepoLock(parentRepo, async () => {
-		await assertSafeManagedDirectory(root, entry.path);
-		const registration = (await git.worktree.list(parentRepo)).find(candidate =>
-			samePath(candidate.path, entry.path),
+	const primaryRepo = (await git.repo.primaryRoot(parentRepo).catch(() => null)) ?? parentRepo;
+	const canonicalPrimary = await fs.realpath(primaryRepo).catch(() => primaryRepo);
+	const repoLockTarget = path.join(root.canonicalPath, `.session-${hashPath(canonicalPrimary)}`);
+
+	try {
+		return await withFileLock(
+			repoLockTarget,
+			() =>
+				git.withRepoLock(parentRepo, async () => {
+					await assertSafeManagedDirectory(root, entry.path);
+					const liveOwner = await readLiveSessionWorktreeOwner(entry.path);
+					if (!options.force && liveOwner) {
+						return removalFailure(
+							target,
+							"refused",
+							`The worktree is owned by an active OMP session ("${liveOwner.name}", pid ${liveOwner.pid}).`,
+							entry,
+							name,
+						);
+					}
+					const registration = (await git.worktree.list(parentRepo)).find(candidate =>
+						samePath(candidate.path, entry.path),
+					);
+					if (!registration || registration.branch !== (entry.branch ? `refs/heads/${entry.branch}` : undefined)) {
+						return removalFailure(
+							target,
+							"refused",
+							"The worktree registration changed while resolving the target; retry the command.",
+							entry,
+							name,
+						);
+					}
+					const lockState = await classifyWorktreeLock(registration.locked, name);
+					if (!options.force) {
+						if (lockState === "exact-live") {
+							return removalFailure(
+								target,
+								"refused",
+								"The worktree is locked by a live OMP session.",
+								entry,
+								name,
+							);
+						}
+						if (lockState === "foreign") {
+							return removalFailure(target, "refused", "The worktree has a foreign lock.", entry, name);
+						}
+
+						const status = await git.status(entry.path, { porcelainV1: true, untrackedFiles: "all", z: true });
+						if (status.length > 0) {
+							return removalFailure(
+								target,
+								"refused",
+								"The worktree has modified, staged, or untracked files; use --force to remove it.",
+								entry,
+								name,
+							);
+						}
+					}
+
+					const branchRef = registration.branch;
+					const expectedOid =
+						registration.head ??
+						(branchRef ? await git.ref.resolve(parentRepo, branchRef) : await git.head.sha(entry.path));
+					if (!options.force && expectedOid && (await hasUniqueCommits(parentRepo, branchRef, expectedOid))) {
+						return removalFailure(
+							target,
+							"refused",
+							"The worktree has unique or unpublished commits; use --force to remove it.",
+							entry,
+							name,
+						);
+					}
+					if (!options.force && !expectedOid) {
+						return removalFailure(
+							target,
+							"refused",
+							"Could not verify whether the worktree has unique or unpublished commits.",
+							entry,
+							name,
+						);
+					}
+
+					const ownsBranch =
+						lockState !== "foreign" && (await provesOmpBranchOwnership(root, entry, name, branchRef));
+					if (options.dryRun) {
+						return removalSuccess(
+							target,
+							entry,
+							name,
+							"would-remove",
+							ownsBranch && expectedOid ? "would-delete" : "would-keep",
+						);
+					}
+
+					if (lockState !== "unlocked") {
+						if (!(await git.worktree.tryUnlock(parentRepo, entry.path))) {
+							return removalFailure(target, "refused", "Could not unlock the resolved worktree.", entry, name);
+						}
+						const afterUnlock = (await git.worktree.list(parentRepo)).find(candidate =>
+							samePath(candidate.path, entry.path),
+						);
+						if (
+							!afterUnlock ||
+							afterUnlock.locked !== undefined ||
+							afterUnlock.branch !== registration.branch ||
+							afterUnlock.head !== registration.head
+						) {
+							return removalFailure(
+								target,
+								"refused",
+								"The worktree registration changed while unlocking it; retry the command.",
+								entry,
+								name,
+							);
+						}
+					}
+
+					await assertSafeManagedDirectory(root, entry.path);
+					if (!(await git.worktree.tryRemove(parentRepo, entry.path, { force: options.force }))) {
+						return removalFailure(
+							target,
+							"refused",
+							"Git refused to remove the resolved worktree; its files and registration were kept.",
+							entry,
+							name,
+						);
+					}
+
+					await removeSessionWorktreeOwner(entry.path);
+
+					let branchAction: RemoveWorktreeBranchAction = branchRef ? "kept" : "none";
+					if (ownsBranch && branchRef && expectedOid) {
+						branchAction = (await git.ref.tryDelete(parentRepo, branchRef, expectedOid)) ? "deleted" : "kept";
+					}
+					return removalSuccess(target, entry, name, "removed", branchAction);
+				}),
+			{ retries: 40, retryDelayMs: 50 },
 		);
-		if (!registration || registration.branch !== (entry.branch ? `refs/heads/${entry.branch}` : undefined)) {
+	} catch (error) {
+		if (error instanceof FileLockContentionError) {
 			return removalFailure(
 				target,
 				"refused",
-				"The worktree registration changed while resolving the target; retry the command.",
+				"Could not acquire worktree lock due to a concurrent omp launch or removal; retry the command.",
 				entry,
 				name,
 			);
 		}
-
-		const lockState = await classifyWorktreeLock(registration.locked, name);
-		if (!options.force) {
-			if (lockState === "exact-live") {
-				return removalFailure(target, "refused", "The worktree is locked by a live OMP session.", entry, name);
-			}
-			if (lockState === "foreign") {
-				return removalFailure(target, "refused", "The worktree has a foreign lock.", entry, name);
-			}
-
-			const status = await git.status(entry.path, { porcelainV1: true, untrackedFiles: "all", z: true });
-			if (status.length > 0) {
-				return removalFailure(
-					target,
-					"refused",
-					"The worktree has modified, staged, or untracked files; use --force to remove it.",
-					entry,
-					name,
-				);
-			}
-		}
-
-		const branchRef = registration.branch;
-		const expectedOid =
-			registration.head ??
-			(branchRef ? await git.ref.resolve(parentRepo, branchRef) : await git.head.sha(entry.path));
-		if (!options.force && expectedOid && (await hasUniqueCommits(parentRepo, branchRef, expectedOid))) {
-			return removalFailure(
-				target,
-				"refused",
-				"The worktree has unique or unpublished commits; use --force to remove it.",
-				entry,
-				name,
-			);
-		}
-		if (!options.force && !expectedOid) {
-			return removalFailure(
-				target,
-				"refused",
-				"Could not verify whether the worktree has unique or unpublished commits.",
-				entry,
-				name,
-			);
-		}
-
-		const ownsBranch = lockState !== "foreign" && (await provesOmpBranchOwnership(root, entry, name, branchRef));
-		if (options.dryRun) {
-			return removalSuccess(
-				target,
-				entry,
-				name,
-				"would-remove",
-				ownsBranch && expectedOid ? "would-delete" : "would-keep",
-			);
-		}
-
-		if (lockState !== "unlocked") {
-			if (!(await git.worktree.tryUnlock(parentRepo, entry.path))) {
-				return removalFailure(target, "refused", "Could not unlock the resolved worktree.", entry, name);
-			}
-			const afterUnlock = (await git.worktree.list(parentRepo)).find(candidate =>
-				samePath(candidate.path, entry.path),
-			);
-			if (
-				!afterUnlock ||
-				afterUnlock.locked !== undefined ||
-				afterUnlock.branch !== registration.branch ||
-				afterUnlock.head !== registration.head
-			) {
-				return removalFailure(
-					target,
-					"refused",
-					"The worktree registration changed while unlocking it; retry the command.",
-					entry,
-					name,
-				);
-			}
-		}
-
-		await assertSafeManagedDirectory(root, entry.path);
-		if (!(await git.worktree.tryRemove(parentRepo, entry.path, { force: options.force }))) {
-			return removalFailure(
-				target,
-				"refused",
-				"Git refused to remove the resolved worktree; its files and registration were kept.",
-				entry,
-				name,
-			);
-		}
-
-		let branchAction: RemoveWorktreeBranchAction = branchRef ? "kept" : "none";
-		if (ownsBranch && branchRef && expectedOid) {
-			branchAction = (await git.ref.tryDelete(parentRepo, branchRef, expectedOid)) ? "deleted" : "kept";
-		}
-		return removalSuccess(target, entry, name, "removed", branchAction);
-	});
+		throw error;
+	}
 }
 
 async function classifyWorktreeLock(
@@ -455,14 +602,9 @@ async function classifyWorktreeLock(
 }
 
 async function hasUniqueCommits(parentRepo: string, branchRef: string | undefined, oid: string): Promise<boolean> {
-	const targetRef = branchRef ? (branchRef.startsWith("refs/") ? branchRef : `refs/heads/${branchRef}`) : null;
-	const refs = await git.ref.list(parentRepo);
-	for (const candidate of refs) {
-		if (targetRef !== null && candidate.name === targetRef) continue;
-		if (candidate.oid === oid) return false;
-		if ((await git.revList.range(parentRepo, candidate.name, oid)).length === 0) return false;
-	}
-	return true;
+	const targetRef = branchRef ? (branchRef.startsWith("refs/") ? branchRef : `refs/heads/${branchRef}`) : undefined;
+	const contained = await git.ref.containsCommit(parentRepo, oid, targetRef ? { excludeRef: targetRef } : undefined);
+	return !contained;
 }
 
 async function provesOmpBranchOwnership(
@@ -486,10 +628,6 @@ function worktreeLogicalName(entry: WorktreeEntry): string | null {
 		return entry.branch.slice("worktree-".length).replaceAll("+", "/");
 	}
 	return entry.branch;
-}
-
-function samePath(left: string, right: string): boolean {
-	return normalizePathForComparison(path.resolve(left)) === normalizePathForComparison(path.resolve(right));
 }
 
 function removalFailure(
@@ -604,14 +742,14 @@ async function scanWorktrees(): Promise<WorktreeScan> {
 	return { entries, root };
 }
 
-function isStrictDescendant(root: string, candidate: string): boolean {
+function isUnder(candidate: string, root: string): boolean {
 	const relative = path.relative(root, candidate);
 	return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 async function isSafeManagedDirectory(root: ManagedRoot, candidate: string): Promise<boolean> {
 	const absoluteCandidate = path.resolve(candidate);
-	if (!isStrictDescendant(root.path, absoluteCandidate)) return false;
+	if (!isUnder(absoluteCandidate, root.path)) return false;
 
 	const relative = path.relative(root.path, absoluteCandidate);
 	let current = root.path;
@@ -622,7 +760,25 @@ async function isSafeManagedDirectory(root: ManagedRoot, candidate: string): Pro
 	}
 
 	const canonicalCandidate = await fs.realpath(absoluteCandidate).catch(() => null);
-	return canonicalCandidate !== null && isStrictDescendant(root.canonicalPath, canonicalCandidate);
+	return canonicalCandidate !== null && isUnder(canonicalCandidate, root.canonicalPath);
+}
+
+async function sweepOrphanedOwnerFiles(rootPath: string): Promise<void> {
+	let files: string[];
+	try {
+		files = await fs.readdir(rootPath);
+	} catch {
+		return;
+	}
+	for (const file of files) {
+		if (!file.endsWith(".owner")) continue;
+		const markerPath = path.join(rootPath, file);
+		const worktreeDir = path.join(rootPath, file.slice(0, -".owner".length));
+		const stat = await fs.lstat(worktreeDir).catch(() => null);
+		if (!stat?.isDirectory()) {
+			await fs.unlink(markerPath).catch(() => null);
+		}
+	}
 }
 
 async function assertSafeManagedDirectory(root: ManagedRoot, candidate: string): Promise<void> {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { writeSessionWorktreeOwner } from "@oh-my-pi/pi-coding-agent/cli/session-worktree-owner";
 import { clearWorktrees } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 import {
 	currentProcessOwner,
@@ -9,7 +10,8 @@ import {
 	writeIsolationOwner,
 } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { hashPath, setWorktreesDir } from "@oh-my-pi/pi-utils";
+import * as fileLockModule from "@oh-my-pi/pi-utils/file-lock";
 
 /**
  * Regression for #6761: `omp worktree clear` (no `--all`) must delete only
@@ -91,7 +93,15 @@ describe("worktree clear isolation", () => {
 		await runGit(repo, ["worktree", "add", "-q", "-b", branch, dir]);
 		await Bun.write(path.join(dir, "unfinished.txt"), `${name} work\n`);
 		if (options.locked) {
-			await runGit(repo, ["worktree", "lock", "--reason", `omp session pid ${process.pid}`, dir]);
+			const owner = await currentProcessOwner();
+			const start = encodeURIComponent(owner.startToken ?? "");
+			await runGit(repo, [
+				"worktree",
+				"lock",
+				"--reason",
+				`omp session ${name} (pid ${owner.pid}; start ${start})`,
+				dir,
+			]);
 		}
 		return { branch, dir, repo };
 	}
@@ -197,17 +207,77 @@ describe("worktree clear isolation", () => {
 		expect(idleRegistration?.locked).toBeUndefined();
 	});
 
-	it("dry-run --all reports a locked session without unlocking or removing it", async () => {
-		const session = await makeSessionWorktree("dry-run-session", { locked: true });
+	it("dry-run --all excludes live-locked and live-owned sessions, but reports unlocked sessions", async () => {
+		const locked = await makeSessionWorktree("dry-run-locked", { locked: true });
+		const owned = await makeSessionWorktree("dry-run-owned", { locked: false });
+		await writeSessionWorktreeOwner(owned.dir, "dry-run-owned");
+		const idle = await makeSessionWorktree("dry-run-idle", { locked: false });
 
 		await clearWorktrees({ all: true, dryRun: true, json: true });
 
-		expect(JSON.parse(output.join("\n"))).toEqual({ wouldRemove: [session.dir] });
-		expect(await fs.readFile(path.join(session.dir, "unfinished.txt"), "utf8")).toBe("dry-run-session work\n");
-		const registration = (await git.worktree.list(session.repo)).find(
-			entry => entry.branch === `refs/heads/${session.branch}`,
-		);
-		expect(registration?.locked).toContain(`pid ${process.pid}`);
-		expect(await git.ref.exists(session.repo, `refs/heads/${session.branch}`)).toBe(true);
+		expect(JSON.parse(output.join("\n"))).toEqual({ wouldRemove: [idle.dir] });
+		expect(await fs.readFile(path.join(locked.dir, "unfinished.txt"), "utf8")).toBe("dry-run-locked work\n");
+		expect(await fs.readFile(path.join(owned.dir, "unfinished.txt"), "utf8")).toBe("dry-run-owned work\n");
+		expect(await fs.readFile(path.join(idle.dir, "unfinished.txt"), "utf8")).toBe("dry-run-idle work\n");
+	});
+
+	it("clear --all removes unlocked sessions while preserving live-locked and live-owned ones", async () => {
+		const locked = await makeSessionWorktree("live-locked", { locked: true });
+		const owned = await makeSessionWorktree("live-owned", { locked: false });
+		await writeSessionWorktreeOwner(owned.dir, "live-owned");
+		const idle = await makeSessionWorktree("unlocked-idle", { locked: false });
+
+		await clearWorktrees({ all: true, dryRun: false, json: true });
+
+		expect(JSON.parse(output.join("\n"))).toMatchObject({ removed: 1, failed: 0 });
+		expect(await fs.stat(idle.dir).catch(() => null)).toBeNull();
+		expect(await fs.stat(locked.dir).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(owned.dir).catch(() => null)).not.toBeNull();
+	});
+
+	it("sweeps orphaned .owner files during clear", async () => {
+		const orphanMarker = path.join(base, "deleted-session-123.owner");
+		await Bun.write(orphanMarker, JSON.stringify({ pid: process.pid, name: "deleted-session" }));
+
+		await clearWorktrees({ all: false, dryRun: false, json: true });
+
+		expect(await fs.stat(orphanMarker).catch(() => null)).toBeNull();
+	});
+
+	it("preserves a worktree that became live-owned concurrently after scan but before locked removal", async () => {
+		const session = await makeSessionWorktree("racy-session", { locked: false });
+
+		const originalWithFileLock = fileLockModule.withFileLock;
+		const lockSpy = vi.spyOn(fileLockModule, "withFileLock").mockImplementation(async (filePath, fn, opts) => {
+			// Simulate concurrent launch writing owner marker after clearWorktrees scanned it as unlocked
+			await writeSessionWorktreeOwner(session.dir, "racy-session");
+			return originalWithFileLock(filePath, fn, opts);
+		});
+
+		try {
+			await clearWorktrees({ all: true, dryRun: false, json: true });
+
+			const parsed = JSON.parse(output.join("\n"));
+			expect(parsed).toMatchObject({ removed: 0 });
+			expect(await fs.stat(session.dir).catch(() => null)).not.toBeNull();
+			expect(await fs.readFile(path.join(session.dir, "unfinished.txt"), "utf8")).toBe("racy-session work\n");
+		} finally {
+			lockSpy.mockRestore();
+		}
+	});
+
+	it("fails with actionable error when worktree lock is contended during clear --all", async () => {
+		const session = await makeSessionWorktree("contended-clear", { locked: false });
+		const canonicalPrimary = await fs.realpath(session.repo);
+		const repoLockTarget = path.join(base, `.session-${hashPath(canonicalPrimary)}`);
+
+		await fileLockModule.withFileLock(repoLockTarget, async () => {
+			await clearWorktrees({ all: true, dryRun: false, json: true });
+			const parsed = JSON.parse(output.join("\n"));
+			expect(parsed.failed).toBe(1);
+			expect(parsed.results[0].ok).toBe(false);
+			expect(parsed.results[0].error).toContain("concurrent omp launch or removal");
+			expect(process.exitCode).toBe(1);
+		});
 	});
 });

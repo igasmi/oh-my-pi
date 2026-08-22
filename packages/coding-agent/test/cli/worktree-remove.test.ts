@@ -2,11 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	sessionWorktreeOwnerPath,
+	writeSessionWorktreeOwner,
+} from "@oh-my-pi/pi-coding-agent/cli/session-worktree-owner";
 import { type RemoveWorktreeOptions, removeWorktree } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 import Worktree from "@oh-my-pi/pi-coding-agent/commands/worktree";
 import { currentProcessOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { hashPath, normalizePathForComparison, setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 
 interface SessionFixture {
 	branch: string;
@@ -252,6 +257,32 @@ describe("worktree remove", () => {
 		expect(result.status).toBe("not-found");
 		expect(await fs.stat(target.dir)).toBeDefined();
 		expect(await git.ref.exists(target.repo, `refs/heads/${target.branch}`)).toBe(true);
+	});
+
+	it("deletes session worktree .owner marker upon successful removal", async () => {
+		const target = await makeSession("with-owner", "with-owner");
+		await writeSessionWorktreeOwner(target.dir, "with-owner");
+		const markerPath = sessionWorktreeOwnerPath(target.dir);
+		expect(await fs.stat(markerPath).catch(() => null)).not.toBeNull();
+
+		const result = await removeWorktree(options(target.dir, { force: true }));
+
+		expect(result.status).toBe("removed");
+		expect(await fs.stat(markerPath).catch(() => null)).toBeNull();
+	});
+
+	it("refuses removal with actionable error if cross-process lock is contended", async () => {
+		const target = await makeSession("contended", "contended");
+		const canonicalPrimary = await fs.realpath(target.repo);
+		const repoLockTarget = path.join(base, `.session-${hashPath(canonicalPrimary)}`);
+
+		let removePromise: Promise<unknown>;
+		await withFileLock(repoLockTarget, async () => {
+			removePromise = removeWorktree(options(target.dir, { force: true }));
+			const result = (await removePromise) as { status: string; reason: string };
+			expect(result.status).toBe("refused");
+			expect(result.reason).toContain("concurrent omp launch or removal");
+		});
 	});
 
 	it("sets process.exitCode to 1 at the command boundary on refused or missing targets", async () => {

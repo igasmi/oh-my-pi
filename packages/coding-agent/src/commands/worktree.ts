@@ -34,7 +34,8 @@ export default class Worktree extends Command {
 			default: false,
 		}),
 		all: Flags.boolean({
-			description: "Clear every entry, including live PR-checkout worktrees (clear)",
+			description:
+				"Clear every entry except live-locked or owner-held sessions, including live PR checkouts (clear)",
 			default: false,
 		}),
 		"dry-run": Flags.boolean({
