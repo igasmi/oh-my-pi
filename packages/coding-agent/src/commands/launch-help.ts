@@ -39,6 +39,11 @@ export const launchHelp = {
 		profile: Flags.string({ description: "Use an isolated profile for auth, sessions, settings, and caches" }),
 		alias: Flags.string({ description: "Create a shell shortcut for the selected profile and exit" }),
 		cwd: Flags.string({ description: "Directory to start in (overrides the launch cwd)" }),
+		worktree: Flags.string({
+			char: "w",
+			description:
+				"Start in an isolated git worktree branched from the remote default branch (name optional; bare -w generates one; #N or a GitHub/GitLab URL checks out that pull request)",
+		}),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, rpc, or rpc-ui",
 			options: ["text", "json", "rpc", "acp", "rpc-ui"],
@@ -112,6 +117,7 @@ export const launchHelp = {
 		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
 		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
 		`# Continue previous session\n  ${APP_NAME} --continue "What did we discuss?"`,
+		`# Start in an isolated worktree\n  ${APP_NAME} -w feature-auth "Implement authentication"`,
 		`# Create a shell shortcut for a work profile\n  ${APP_NAME} --profile work --alias omp-work`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,

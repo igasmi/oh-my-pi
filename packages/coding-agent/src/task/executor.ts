@@ -49,6 +49,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
+import type { WorktreeIsolation } from "../session/worktree-isolation";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
@@ -344,6 +345,12 @@ export interface ExecutorOptions {
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
 	worktree?: string;
+	/** Parent manager's persisted `-w` binding. Threaded into the child's session
+	 *  manager only for non-isolated runs (cwd must equal the worktree root). */
+	worktreeIsolation?: WorktreeIsolation;
+	/** Worktree write-guard context, propagated to EVERY child (isolated included)
+	 *  via CreateAgentSessionOptions so file tools refuse primary-checkout writes. */
+	worktreeWriteGuard?: WorktreeIsolation;
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
@@ -1100,12 +1107,6 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	const requestAbort = (reason: AbortReason) => {
-		if (reason === "timeout") {
-			runtimeLimitExceeded = true;
-		}
-		if (reason === "budget") {
-			budgetLimitExceeded = true;
-		}
 		if (abortSent) {
 			// Shutdown is a superseding external abort: a process teardown that
 			// races a self-inflicted budget hard-abort must still follow the
@@ -1127,6 +1128,19 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			return;
 		}
 		if (resolved) return;
+		// Limit flags must stay below the abortSent/resolved guards, next to the
+		// abortReason they mirror. The wall-clock timer can fire during teardown —
+		// after a budget hard-abort or a committed yield has already settled the
+		// run — and resolveAbortReasonText/finalizeRunResult read these flags
+		// (not abortReason), so a post-commitment timeout must not set them or it
+		// rewrites the real outcome (budget kill mislabeled, completed yield tagged
+		// aborted).
+		if (reason === "timeout") {
+			runtimeLimitExceeded = true;
+		}
+		if (reason === "budget") {
+			budgetLimitExceeded = true;
+		}
 		abortSent = true;
 		abortReason = reason;
 		abortController.abort();
@@ -2968,12 +2982,19 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
+			// The manager binding requires cwd === worktreeRoot, which a task-
+			// isolation sandbox violates by design; those children receive the
+			// write guard via CreateAgentSessionOptions.worktreeIsolation instead.
+			const inheritedWorktreeIsolation = worktree === undefined ? options.worktreeIsolation : undefined;
 			const sessionManagerPromise = sessionFile
 				? SessionManager.open(sessionFile, undefined, undefined, {
 						initialCwd: effectiveCwd,
 						suppressBreadcrumb: true,
+						worktreeIsolation: inheritedWorktreeIsolation,
 					})
-				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
+				: Promise.resolve(
+						SessionManager.inMemory(effectiveCwd, undefined, { worktreeIsolation: inheritedWorktreeIsolation }),
+					);
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
 			sessionManagerPromise.catch(() => {});
@@ -3062,6 +3083,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			): CreateAgentSessionOptions => ({
 				cwd: worktree ?? cwd,
 				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
+				// Every child inherits the write-guard context — including isolated
+				// runs, whose file tools could otherwise still write absolute paths
+				// into the primary checkout (the sandbox merge never sees those).
+				worktreeWriteGuard: options.worktreeWriteGuard ?? options.worktreeIsolation,
 				authStorage,
 				modelRegistry,
 				getApiKey: options.getApiKey,
@@ -3161,6 +3186,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				reviveSession = async expectedAgentRef => {
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
+						worktreeIsolation: options.worktreeIsolation,
 					});
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);

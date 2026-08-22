@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { isEnoent } from "./fs-error";
 
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
@@ -162,12 +163,30 @@ export function normalizePathForComparison(inputPath: string): string {
 	const resolvedPath = resolveEquivalentPath(inputPath);
 	return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
 }
+/**
+ * Compare two paths for equivalence after resolving them and canonicalizing symlinks.
+ *
+ * Note: uses `normalizePathForComparison`, which performs synchronous `realpathSync` operations.
+ */
+export function samePath(left: string, right: string): boolean {
+	return normalizePathForComparison(path.resolve(left)) === normalizePathForComparison(path.resolve(right));
+}
+
+/**
+ * Purely lexical path containment check without filesystem I/O (no realpath).
+ * Inputs must be absolute paths; on Windows, comparison is case-insensitive.
+ */
+export function lexicalPathIsWithin(root: string, candidate: string): boolean {
+	const resolvedRoot = path.resolve(root);
+	const resolvedCandidate = path.resolve(candidate);
+	const comparisonRoot = process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot;
+	const comparisonCandidate = process.platform === "win32" ? resolvedCandidate.toLowerCase() : resolvedCandidate;
+	const relative = path.relative(comparisonRoot, comparisonCandidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 
 export function pathIsWithin(root: string, candidate: string): boolean {
-	const normalizedRoot = normalizePathForComparison(root);
-	const normalizedCandidate = normalizePathForComparison(candidate);
-	const relative = path.relative(normalizedRoot, normalizedCandidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	return lexicalPathIsWithin(normalizePathForComparison(root), normalizePathForComparison(candidate));
 }
 
 export function relativePathWithinRoot(root: string, candidate: string): string | null {
@@ -176,6 +195,18 @@ export function relativePathWithinRoot(root: string, candidate: string): string 
 	const normalizedCandidate = normalizePathForComparison(candidate);
 	const relative = path.relative(normalizedRoot, normalizedCandidate);
 	return relative || null;
+}
+
+/**
+ * Asynchronously read `lstat` for `filePath`, returning `null` when the path does not exist (`ENOENT`).
+ */
+export async function lstatOptional(filePath: string): Promise<fs.Stats | null> {
+	try {
+		return await fs.promises.lstat(filePath);
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
 }
 
 let projectDir = standardizeMacOSPath(process.cwd());
@@ -579,9 +610,9 @@ function resolveWorktreeBase(value: string | undefined): string | undefined {
 let worktreesDirOverride: string | undefined;
 
 /**
- * Relocate the base directory for agent-managed worktrees (PR checkouts, task
- * isolation, and `omp worktree` cleanup all read the same base). Driven by the
- * `worktree.base` setting in coding-agent; pass `undefined`/empty to clear and
+ * Relocate the base directory for agent-managed worktrees (CLI sessions, PR
+ * checkouts, task isolation, and `omp worktree` cleanup all read the same
+ * base). Driven by the `worktree.base` setting in coding-agent; pass `undefined`/empty to clear and
  * fall back to `OMP_WORKTREE_DIR` or the `~/.omp/wt` default.
  *
  * `~` is expanded and a relative path is rejected (see {@link resolveWorktreeBase}).
@@ -648,7 +679,7 @@ export function getAutoQaDbPath(): string {
  * Stable 7-character hex digest of an absolute filesystem path.
  *
  * Used to pack the project identity into a single short fs-safe segment
- * (e.g. PR-checkout and task-isolation worktree dirs under `~/.omp/wt/`).
+ * (e.g. session, PR-checkout, and task-isolation dirs under `~/.omp/wt/`).
  * Bun.hash is non-cryptographic — collision space is ~2^28, which is fine
  * for naming a handful of repos on a single machine. Same input on the
  * same Bun runtime yields the same output.

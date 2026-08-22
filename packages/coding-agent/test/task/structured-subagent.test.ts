@@ -8,6 +8,7 @@ import {
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
+import type { WorktreeIsolation } from "@oh-my-pi/pi-coding-agent/session/worktree-isolation";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
@@ -38,6 +39,8 @@ function session(
 		isolationMode?: "none" | "worktree";
 		isolationApply?: boolean;
 		modelRoles?: Record<string, string>;
+		worktreeIsolation?: WorktreeIsolation;
+		worktreeWriteGuard?: WorktreeIsolation;
 	} = {},
 ): ToolSession {
 	return {
@@ -54,6 +57,8 @@ function session(
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
+		getWorktreeIsolation: () => options.worktreeIsolation,
+		getWorktreeWriteGuard: () => options.worktreeWriteGuard ?? options.worktreeIsolation,
 	} as unknown as ToolSession;
 }
 
@@ -215,6 +220,60 @@ describe("structured subagent primitive", () => {
 		expect(settled.result.modelRole).toBe("reviewer");
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+
+	it("hands the parent -w binding to the executor so non-isolated children inherit the write guard", async () => {
+		mockDiscovery();
+		const binding: WorktreeIsolation = {
+			worktreeRoot: "/tmp",
+			primaryRoot: "/tmp-primary-checkout",
+			name: "wt",
+			branch: "worktree-wt",
+			commonDir: "/tmp-primary-checkout/.git",
+		};
+		const dispatched: executorModule.ExecutorOptions[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched.push(options);
+			return result();
+		});
+
+		const settled = await runStructuredSubagent(
+			request({ session: session({ worktreeIsolation: binding }), retainArtifacts: true }),
+		);
+
+		// Identity: the executor gates on this exact object for non-isolated runs.
+		expect(dispatched[0]?.worktreeIsolation).toBe(binding);
+		expect(dispatched[0]?.worktreeWriteGuard).toBe(binding);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("forwards only the guard context when spawning from an isolated child (no manager binding)", async () => {
+		mockDiscovery();
+		const guard: WorktreeIsolation = {
+			worktreeRoot: "/tmp-elsewhere-worktree",
+			primaryRoot: "/tmp-primary-checkout",
+			name: "wt",
+			branch: "worktree-wt",
+			commonDir: "/tmp-primary-checkout/.git",
+		};
+		const dispatched: executorModule.ExecutorOptions[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched.push(options);
+			return result();
+		});
+
+		// Isolated-child shape: getWorktreeIsolation() is undefined (sandbox cwd),
+		// getWorktreeWriteGuard() carries the ancestor guard. The grandchild must
+		// receive the guard WITHOUT a persistable binding — the pre-split shape
+		// made its session manager throw a cwd mismatch at spawn.
+		const settled = await runStructuredSubagent(
+			request({ session: session({ worktreeWriteGuard: guard }), retainArtifacts: true }),
+		);
+
+		expect(dispatched[0]?.worktreeIsolation).toBeUndefined();
+		expect(dispatched[0]?.worktreeWriteGuard).toBe(guard);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
 	it("does not treat a spawn handle as the HUD description", async () => {
 		mockDiscovery();
 		const dispatched: executorModule.ExecutorOptions[] = [];

@@ -15,6 +15,7 @@ import {
 	getSessionsDir,
 	isEnoent,
 	logger,
+	normalizePathForComparison,
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
@@ -87,6 +88,7 @@ import {
 	normalizeSessionWorkspace,
 	normalizeWorkspaceDirectory,
 } from "./session-workspace";
+import { validateWorktreeIsolation, type WorktreeIsolation, WorktreeIsolationError } from "./worktree-isolation";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
@@ -359,6 +361,7 @@ class SessionEntryIndex {
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
+	| "getWorktreeIsolation"
 	| "getSessionDir"
 	| "getSessionId"
 	| "getSessionFile"
@@ -380,6 +383,29 @@ export type ReadonlySessionManager = Pick<
 	| "putBlob"
 	| "putBlobSync"
 >;
+
+export interface SessionManagerCreateOptions {
+	worktreeIsolation?: WorktreeIsolation;
+}
+
+export interface SessionManagerOpenOptions {
+	initialCwd?: string;
+	suppressBreadcrumb?: boolean;
+	/**
+	 * Adopt this verified binding when the opened header carries none (subagent
+	 * sessions inherit the parent's `-w` binding). Applied only when the manager
+	 * cwd matches the binding's worktree root; a mismatch is logged and skipped
+	 * so task-isolation revives never fail on an inherited binding.
+	 */
+	worktreeIsolation?: WorktreeIsolation;
+}
+
+export interface SessionManagerForkOptions {
+	copyArtifacts?: boolean;
+	suppressBreadcrumb?: boolean;
+	sessionFile?: string;
+	worktreeIsolation?: WorktreeIsolation;
+}
 
 interface SessionManagerStateSnapshot {
 	cwd: string;
@@ -459,6 +485,7 @@ export class SessionManager {
 	#cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root). Normalized absolute, deduped, excludes cwd. */
 	#additionalDirectories: string[] = [];
+	#worktreeIsolation: WorktreeIsolation | undefined;
 	#sessionDir: string;
 	readonly #persist: boolean;
 	readonly #storage: SessionStorage;
@@ -1086,33 +1113,53 @@ export class SessionManager {
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
-		this.#diskTail = Promise.resolve();
-		this.#clearDiskError();
-		this.#sessionId = mintSessionId();
-		this.#sessionName = undefined;
-		this.#titleSource = undefined;
-		this.#titleUpdatedAt = "";
-		this.#hasTitleSlot = true;
+		const candidateWorktreeIsolation = options?.worktreeIsolation ?? this.#worktreeIsolation;
+		if (
+			candidateWorktreeIsolation &&
+			normalizePathForComparison(this.#cwd) !== normalizePathForComparison(candidateWorktreeIsolation.worktreeRoot)
+		) {
+			throw new WorktreeIsolationError("Session cwd does not match its isolated worktree root.", "tampered");
+		}
 
-		const timestamp = nowIso();
-		this.#header = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: this.#sessionId,
-			timestamp,
-			cwd: this.#cwd,
-			parentSession: options?.parentSession,
-			providerPromptCacheKey: options?.providerPromptCacheKey,
-		};
 		const workspace = normalizeSessionWorkspace({
 			cwd: this.#cwd,
 			directories: options?.additionalDirectories ?? [],
 		});
-		this.#additionalDirectories = additionalWorkspaceDirectories(workspace);
-		if (this.#additionalDirectories.length > 0) {
-			this.#header.additionalDirectories = [...this.#additionalDirectories];
+		const additionalDirectories = additionalWorkspaceDirectories(workspace);
+
+		const sessionId = mintSessionId();
+		const timestamp = nowIso();
+		const worktreeIsolation = candidateWorktreeIsolation ? { ...candidateWorktreeIsolation } : undefined;
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionId,
+			timestamp,
+			cwd: this.#cwd,
+			parentSession: options?.parentSession,
+			providerPromptCacheKey: options?.providerPromptCacheKey,
+			worktreeIsolation,
+		};
+		if (additionalDirectories.length > 0) {
+			header.additionalDirectories = [...additionalDirectories];
 		}
+
+		let sessionFile: string | undefined;
+		if (this.#persist) {
+			sessionFile =
+				forcedSessionFile ?? path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${sessionId}.jsonl`);
+		}
+
+		this.#diskTail = Promise.resolve();
+		this.#clearDiskError();
+		this.#sessionId = sessionId;
+		this.#sessionName = undefined;
+		this.#titleSource = undefined;
 		this.#titleUpdatedAt = timestamp;
+		this.#hasTitleSlot = true;
+		this.#worktreeIsolation = worktreeIsolation;
+		this.#header = header;
+		this.#additionalDirectories = additionalDirectories;
 
 		this.#entries = [];
 		this.#index.clear();
@@ -1130,13 +1177,9 @@ export class SessionManager {
 		this.#inMemoryArtifacts = null;
 		this.#inMemoryArtifactCounter = 0;
 
-		if (this.#persist) {
-			this.#sessionFile =
-				forcedSessionFile ??
-				path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
+		this.#sessionFile = sessionFile;
+		if (this.#persist && this.#sessionFile) {
 			this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, true);
-		} else {
-			this.#sessionFile = undefined;
 		}
 
 		return this.#sessionFile;
@@ -1144,6 +1187,7 @@ export class SessionManager {
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
+		this.#worktreeIsolation = header.worktreeIsolation;
 		this.#entries = entries;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
@@ -1349,21 +1393,27 @@ export class SessionManager {
 		await this.#setSessionFile(sessionFile);
 	}
 
-	async #setSessionFile(sessionFile: string, loadedSession?: SessionLoadResult): Promise<void> {
+	async #setSessionFile(
+		sessionFile: string,
+		loadedSession?: SessionLoadResult,
+		inheritedWorktreeIsolation?: WorktreeIsolation,
+	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
 
 		const resolvedSessionFile = path.resolve(sessionFile);
-		this.#sessionFile = resolvedSessionFile;
-		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
-
 		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
 		const { entries: fileEntries, titleSlot } = loaded;
 		if (fileEntries.length === 0) {
 			// Explicit but empty/missing path (e.g. --session flag): start fresh but
 			// keep the requested path and materialize the header immediately.
-			this.#resetToNewSession(undefined, resolvedSessionFile);
+			// #resetToNewSession validates (and can throw) before mutating and
+			// assigns #sessionFile from the forced path itself.
+			this.#resetToNewSession(
+				inheritedWorktreeIsolation ? { worktreeIsolation: inheritedWorktreeIsolation } : undefined,
+				resolvedSessionFile,
+			);
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
 			this.#fileIsCurrent = true;
@@ -1374,6 +1424,58 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
+		if (header.worktreeIsolation !== undefined) {
+			const validation = await validateWorktreeIsolation(header.worktreeIsolation);
+			if (validation.status !== "valid") {
+				throw new WorktreeIsolationError(validation.reason, validation.status);
+			}
+			header.worktreeIsolation = validation.isolation;
+			if (
+				typeof header.cwd !== "string" ||
+				normalizePathForComparison(header.cwd) !== normalizePathForComparison(validation.isolation.worktreeRoot)
+			) {
+				throw new WorktreeIsolationError("Session cwd does not match its isolated worktree root.", "tampered");
+			}
+		}
+		// Resolve the cwd this manager will end up with (see adoption below) so
+		// every binding decision is made before any instance field mutates.
+		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
+		const adoptHeaderCwd =
+			headerCwd !== undefined && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd));
+		const nextCwd = adoptHeaderCwd ? headerCwd : this.#cwd;
+		let adoptedInheritedBinding = false;
+		if (inheritedWorktreeIsolation && header.worktreeIsolation !== undefined) {
+			// A caller-supplied parent binding must describe the SAME worktree the
+			// file is already bound to — a child file bound to a different (even
+			// valid) worktree indicates cross-session reuse; fail closed.
+			const existing = header.worktreeIsolation;
+			if (
+				normalizePathForComparison(existing.worktreeRoot) !==
+					normalizePathForComparison(inheritedWorktreeIsolation.worktreeRoot) ||
+				normalizePathForComparison(existing.primaryRoot) !==
+					normalizePathForComparison(inheritedWorktreeIsolation.primaryRoot) ||
+				existing.branch !== inheritedWorktreeIsolation.branch
+			) {
+				throw new WorktreeIsolationError(
+					"Session file is bound to a different worktree than the inherited binding.",
+					"tampered",
+				);
+			}
+		}
+		if (inheritedWorktreeIsolation && header.worktreeIsolation === undefined) {
+			if (
+				normalizePathForComparison(nextCwd) !== normalizePathForComparison(inheritedWorktreeIsolation.worktreeRoot)
+			) {
+				throw new WorktreeIsolationError(
+					"Inherited worktree binding does not match the session working directory.",
+					"tampered",
+				);
+			}
+			header.worktreeIsolation = { ...inheritedWorktreeIsolation };
+			adoptedInheritedBinding = true;
+		}
+		this.#sessionFile = resolvedSessionFile;
+		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
 		// Adopt the loaded session's working directory. Sessions live in a dir
 		// keyed by their cwd, so resuming a session from another project must
@@ -1381,9 +1483,8 @@ export class SessionManager {
 		// no longer exists on disk, in which case adopting it (and the process
 		// chdir interactive mode then performs) would fail with ENOENT. Keep the
 		// current cwd so the resumed session stays where the user already is.
-		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd))) {
-			this.#cwd = headerCwd;
+		if (adoptHeaderCwd) {
+			this.#cwd = nextCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 		}
@@ -1393,7 +1494,7 @@ export class SessionManager {
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
 		this.#fileIsCurrent = true;
-		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
+		this.#rewriteRequired = migrated || loaded.malformedRecords > 0 || adoptedInheritedBinding;
 		this.#forceFileCreation = true;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
@@ -1438,6 +1539,7 @@ export class SessionManager {
 			id: this.#sessionId,
 			title: this.#header.title ?? this.#sessionName,
 			titleSource: this.#header.titleSource ?? this.#titleSource,
+			worktreeIsolation: this.#worktreeIsolation,
 			timestamp,
 			cwd: this.#cwd,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
@@ -1570,6 +1672,13 @@ export class SessionManager {
 			this.#cwd = resolvedCwd;
 			this.#sessionDir = nextSessionDir;
 			this.#header.cwd = resolvedCwd;
+			if (
+				this.#worktreeIsolation &&
+				normalizePathForComparison(resolvedCwd) !== normalizePathForComparison(this.#worktreeIsolation.worktreeRoot)
+			) {
+				this.#worktreeIsolation = undefined;
+				this.#header.worktreeIsolation = undefined;
+			}
 			// Re-filter additional roots: the new cwd may have been an additional root,
 			// or it may now contain/subsume one. Re-normalize to keep the invariant
 			// that cwd is never also listed as an additional directory.
@@ -1616,6 +1725,8 @@ export class SessionManager {
 		manager.#sessionName = this.#sessionName;
 		manager.#titleSource = this.#titleSource;
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
+		manager.#worktreeIsolation = this.#worktreeIsolation ? { ...this.#worktreeIsolation } : undefined;
+		manager.#header.worktreeIsolation = manager.#worktreeIsolation;
 		manager.#header.title = this.#sessionName;
 		manager.#header.titleSource = this.#titleSource;
 		manager.#additionalDirectories = [...this.#additionalDirectories];
@@ -1840,6 +1951,11 @@ export class SessionManager {
 
 	getCwd(): string {
 		return this.#cwd;
+	}
+
+	/** Verified linked-worktree binding carried by this session, when present. */
+	getWorktreeIsolation(): WorktreeIsolation | undefined {
+		return this.#worktreeIsolation ? { ...this.#worktreeIsolation } : undefined;
 	}
 
 	/** Additional workspace directories beyond cwd (multi-root), absolute and normalized. */
@@ -2563,6 +2679,7 @@ export class SessionManager {
 			id: newSessionId,
 			timestamp,
 			cwd: this.#cwd,
+			worktreeIsolation: this.#worktreeIsolation,
 			title: this.#sessionName,
 			titleSource: this.#titleSource,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
@@ -2623,10 +2740,15 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		options: SessionManagerCreateOptions = {},
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
-		manager.#resetToNewSession();
+		manager.#resetToNewSession({ worktreeIsolation: options.worktreeIsolation });
 		return manager;
 	}
 
@@ -2666,7 +2788,7 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { copyArtifacts?: boolean; suppressBreadcrumb?: boolean; sessionFile?: string },
+		options: SessionManagerForkOptions = {},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
@@ -2678,10 +2800,32 @@ export class SessionManager {
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		let sourceWorktreeIsolation: WorktreeIsolation | undefined;
+		if (sourceHeader?.worktreeIsolation !== undefined) {
+			const validation = await validateWorktreeIsolation(sourceHeader.worktreeIsolation);
+			if (validation.status !== "valid") {
+				throw new WorktreeIsolationError(validation.reason, validation.status);
+			}
+			sourceWorktreeIsolation = validation.isolation;
+		}
+		let worktreeIsolation = options.worktreeIsolation;
+		if (worktreeIsolation) {
+			const validation = await validateWorktreeIsolation(worktreeIsolation);
+			if (validation.status !== "valid") {
+				throw new WorktreeIsolationError(validation.reason, validation.status);
+			}
+			worktreeIsolation = validation.isolation;
+		} else if (
+			sourceWorktreeIsolation &&
+			normalizePathForComparison(cwd) === normalizePathForComparison(sourceWorktreeIsolation.worktreeRoot)
+		) {
+			worktreeIsolation = sourceWorktreeIsolation;
+		}
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
 				providerPromptCacheKey: sourceHeader?.providerPromptCacheKey ?? sourceHeader?.id,
+				worktreeIsolation,
 			},
 			options?.sessionFile,
 		);
@@ -2714,7 +2858,7 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options: SessionManagerOpenOptions = {},
 	): Promise<SessionManager> {
 		const loaded = await loadSessionFile(filePath, storage);
 		const header = loaded.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -2733,7 +2877,7 @@ export class SessionManager {
 				: path.dirname(path.resolve(filePath)));
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
-		await manager.#setSessionFile(filePath, loaded);
+		await manager.#setSessionFile(filePath, loaded, options.worktreeIsolation);
 		return manager;
 	}
 
@@ -2818,6 +2962,7 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		options: SessionManagerCreateOptions = {},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const resolvedCwd = path.resolve(cwd);
@@ -2833,7 +2978,7 @@ export class SessionManager {
 			// exists=false only when fresh, so this never masks a real stale crumb.
 			if (breadcrumb.fresh && !breadcrumb.exists) {
 				const manager = new SessionManager(cwd, dir, true, storage);
-				manager.#resetToNewSession();
+				manager.#resetToNewSession({ worktreeIsolation: options.worktreeIsolation });
 				return manager;
 			}
 
@@ -2891,7 +3036,7 @@ export class SessionManager {
 
 		const manager = new SessionManager(cwd, dir, true, storage);
 		if (chosenSession) await manager.setSessionFile(chosenSession);
-		else manager.#resetToNewSession();
+		else manager.#resetToNewSession({ worktreeIsolation: options.worktreeIsolation });
 		return manager;
 	}
 
@@ -2899,9 +3044,10 @@ export class SessionManager {
 	static inMemory(
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
+		options: SessionManagerCreateOptions = {},
 	): SessionManager {
 		const manager = new SessionManager(cwd, "", false, storage);
-		manager.#resetToNewSession();
+		manager.#resetToNewSession({ worktreeIsolation: options.worktreeIsolation });
 		return manager;
 	}
 

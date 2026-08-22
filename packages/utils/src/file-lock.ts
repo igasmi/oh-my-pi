@@ -15,6 +15,14 @@ export interface FileLockOptions {
 	retryDelayMs?: number;
 }
 
+/** Thrown when the lock stays contended for the whole retry budget. */
+export class FileLockContentionError extends Error {
+	constructor(filePath: string, attempts: number) {
+		super(`Failed to acquire lock for ${filePath} after ${attempts} attempts`);
+		this.name = "FileLockContentionError";
+	}
+}
+
 const DEFAULT_OPTIONS: Required<FileLockOptions> = {
 	retries: 50,
 	retryDelayMs: 100,
@@ -39,7 +47,7 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 		if (attempt + 1 < opts.retries) await Bun.sleep(opts.retryDelayMs);
 	}
 
-	throw new Error(`Failed to acquire lock for ${filePath} after ${opts.retries} attempts`);
+	throw new FileLockContentionError(filePath, opts.retries);
 }
 
 /** Run `fn` while holding an OS-backed exclusive lock for `filePath`. */

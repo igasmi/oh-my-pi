@@ -24,6 +24,8 @@ export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	/** Create or reuse an isolated git worktree; `true` requests a generated name. */
+	worktree?: string | true;
 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
 	addDir?: string[];
 	profile?: string;
@@ -219,6 +221,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
 			const config = OPTIONAL_FLAGS[arg];
 			const next = args[i + 1];
+			if (config.emptyValueError !== undefined && next === "") {
+				throw new CliUsageError(config.emptyValueError);
+			}
 			const consume =
 				next !== undefined && !next.startsWith("-") && !(config.rejectEmpty === true && next.length === 0);
 			config.set(result, consume ? args[++i] : undefined);

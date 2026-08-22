@@ -1431,6 +1431,8 @@ export class VibeSessionRegistry {
 		};
 		return {
 			cwd: session.cwd,
+			worktreeIsolation: session.getWorktreeIsolation?.(),
+			worktreeWriteGuard: session.getWorktreeWriteGuard?.() ?? session.getWorktreeIsolation?.(),
 			agent: record.agent,
 			task: message,
 			assignment: message,

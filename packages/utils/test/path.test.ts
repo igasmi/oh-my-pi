@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
+import { lexicalPathIsWithin, lstatOptional, pathIsWithin, samePath } from "../src/dirs";
 import { stripWindowsExtendedLengthPathPrefix } from "../src/path";
 
 describe("stripWindowsExtendedLengthPathPrefix", () => {
@@ -14,5 +17,50 @@ describe("stripWindowsExtendedLengthPathPrefix", () => {
 	it("leaves non-Windows paths unchanged", () => {
 		const path = "\\\\?\\C:\\Users\\Shi Xin\\omp.exe";
 		expect(stripWindowsExtendedLengthPathPrefix(path, "linux")).toBe(path);
+	});
+});
+
+describe("pathIsWithin", () => {
+	it("allows dot-prefixed child directories and files", () => {
+		const base = path.resolve("workspace");
+		expect(pathIsWithin(base, path.join(base, "..cache"))).toBe(true);
+		expect(pathIsWithin(base, path.join(base, "..cache", "token"))).toBe(true);
+		expect(pathIsWithin(base, path.join(base, "...triple-dot"))).toBe(true);
+		expect(pathIsWithin(base, path.join(base, "normal-child"))).toBe(true);
+		expect(pathIsWithin(base, base)).toBe(true);
+	});
+
+	it("rejects true parent and sibling escapes", () => {
+		const base = path.resolve("workspace");
+		expect(pathIsWithin(base, path.resolve(base, ".."))).toBe(false);
+		expect(pathIsWithin(base, path.resolve(base, "..", "sibling"))).toBe(false);
+		expect(pathIsWithin(base, path.resolve(base, "../..", "other"))).toBe(false);
+	});
+});
+
+describe("lexicalPathIsWithin", () => {
+	it("performs lexical containment without disk lookups", () => {
+		const base = path.resolve("canonical-root");
+		expect(lexicalPathIsWithin(base, path.join(base, "sub", "file.txt"))).toBe(true);
+		expect(lexicalPathIsWithin(base, base)).toBe(true);
+		expect(lexicalPathIsWithin(base, path.resolve("other-root"))).toBe(false);
+	});
+});
+
+describe("samePath", () => {
+	it("matches equivalent paths", () => {
+		const dir = process.cwd();
+		expect(samePath(dir, path.join(dir, ".", "sub", ".."))).toBe(true);
+	});
+});
+
+describe("lstatOptional", () => {
+	it("returns Stats for existing paths and null for ENOENT", async () => {
+		const existing = await lstatOptional(process.cwd());
+		expect(existing).not.toBeNull();
+		expect(existing?.isDirectory()).toBe(true);
+
+		const missing = await lstatOptional(path.join(os.tmpdir(), `omp-nonexistent-path-${Date.now()}`));
+		expect(missing).toBeNull();
 	});
 });

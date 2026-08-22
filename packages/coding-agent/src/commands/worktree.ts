@@ -5,7 +5,7 @@
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { worktreeHelp as commandHelp } from "../cli/command-help";
-import { clearWorktrees, listWorktrees } from "../cli/worktree-cli";
+import { clearWorktrees, listWorktrees, removeWorktree } from "../cli/worktree-cli";
 import { Settings } from "../config/settings";
 
 export default class Worktree extends Command {
@@ -13,24 +13,34 @@ export default class Worktree extends Command {
 	static aliases = ["wt"];
 
 	static args = {
-		// `list` (default) inspects the worktree dir; `clear` removes entries.
-		// A positional action keeps `omp worktree` (the no-arg form) useful.
+		// `list` (default) inspects the worktree dir; `clear` removes entries;
+		// `remove` resolves and removes one registered target.
 		action: Args.string({
-			description: "list (default) or clear",
+			description: "list (default), clear, or remove",
 			required: false,
-			options: ["list", "clear"],
+			options: ["list", "clear", "remove"],
 			default: "list",
+		}),
+		target: Args.string({
+			description: "Worktree name or exact registered path (remove)",
+			required: false,
 		}),
 	};
 
 	static flags = {
+		force: Flags.boolean({
+			char: "f",
+			description: "Remove the resolved target despite locks, changes, or unique commits (remove)",
+			default: false,
+		}),
 		all: Flags.boolean({
-			description: "Clear every entry, including live PR-checkout worktrees (clear)",
+			description:
+				"Clear every entry except live-locked or owner-held sessions, including live PR checkouts (clear)",
 			default: false,
 		}),
 		"dry-run": Flags.boolean({
 			char: "n",
-			description: "Print what would be removed without touching the filesystem (clear)",
+			description: "Print what would be removed without touching the filesystem (clear/remove)",
 			default: false,
 		}),
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: false }),
@@ -39,6 +49,9 @@ export default class Worktree extends Command {
 	static examples = [
 		"omp worktree",
 		"omp worktree list --json",
+		"omp worktree remove feature/auth",
+		"omp worktree remove /absolute/path --dry-run",
+		"omp worktree remove feature/auth --force --json",
 		"omp worktree clear",
 		"omp worktree clear --dry-run",
 		"omp worktree clear --all",
@@ -56,6 +69,19 @@ export default class Worktree extends Command {
 				dryRun: flags["dry-run"] ?? false,
 				json: flags.json ?? false,
 			});
+			return;
+		}
+		if (args.action === "remove") {
+			const result = await removeWorktree({
+				cwd: process.cwd(),
+				dryRun: flags["dry-run"] ?? false,
+				force: flags.force ?? false,
+				json: flags.json ?? false,
+				target: args.target ?? "",
+			});
+			if (result.status === "not-found" || result.status === "refused") {
+				process.exitCode = 1;
+			}
 			return;
 		}
 		await listWorktrees({ json: flags.json ?? false });

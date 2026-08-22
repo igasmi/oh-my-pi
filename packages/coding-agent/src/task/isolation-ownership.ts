@@ -12,18 +12,22 @@ import { $ } from "bun";
 /** Marker file written into a task-isolation base dir identifying its owner. */
 export const ISOLATION_OWNER_FILE = ".omp-isolation-owner.json";
 
-/** Recorded owner of a task-isolation sandbox. */
-export interface IsolationOwner {
-	/** PID of the omp process that created and owns the sandbox. */
+/** Stable identity for one operating-system process instance. */
+export interface ProcessOwner {
+	/** PID of the owning process. */
 	pid: number;
-	/** Task id the sandbox was materialised for. */
-	id: string;
 	/**
 	 * Process-instance start-time token for {@link pid}, when the OS can report
-	 * it. Distinguishes the owning process from an unrelated process that later
-	 * inherits a recycled pid, so a crashed sandbox is never pinned live.
+	 * it. Distinguishes the owner from an unrelated process that later inherits
+	 * a recycled pid.
 	 */
 	startToken?: string;
+}
+
+/** Recorded owner of a task-isolation sandbox. */
+export interface IsolationOwner extends ProcessOwner {
+	/** Task id the sandbox was materialised for. */
+	id: string;
 }
 
 /**
@@ -57,6 +61,34 @@ async function processStartToken(pid: number): Promise<string | null> {
 	return started.length > 0 ? started : null;
 }
 
+/** Capture the current process's PID plus its boot-stable start token when available. */
+export async function currentProcessOwner(): Promise<ProcessOwner> {
+	const startToken = await processStartToken(process.pid);
+	return { pid: process.pid, ...(startToken ? { startToken } : {}) };
+}
+
+/**
+ * Whether `owner` still identifies the same live process instance.
+ *
+ * `process.kill(pid, 0)` can fail with `EPERM` even when the process is alive,
+ * so only `ESRCH` counts as dead. A start token rejects recycled PIDs.
+ */
+export async function isProcessOwnerLive(owner: unknown): Promise<boolean> {
+	if (typeof owner !== "object" || owner === null || !("pid" in owner)) return false;
+	const pid = owner.pid;
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+	}
+	if ("startToken" in owner && typeof owner.startToken === "string" && owner.startToken.length > 0) {
+		const current = await processStartToken(pid);
+		if (current !== null && current !== owner.startToken) return false;
+	}
+	return true;
+}
+
 /**
  * Record the current process as owner of the sandbox rooted at `baseDir`.
  *
@@ -64,8 +96,7 @@ async function processStartToken(pid: number): Promise<string | null> {
  * `omp worktree clear` never sees an owner-less sandbox mid-creation.
  */
 export async function writeIsolationOwner(baseDir: string, id: string): Promise<void> {
-	const startToken = await processStartToken(process.pid);
-	const owner: IsolationOwner = { pid: process.pid, id, ...(startToken ? { startToken } : {}) };
+	const owner: IsolationOwner = { ...(await currentProcessOwner()), id };
 	await Bun.write(path.join(baseDir, ISOLATION_OWNER_FILE), JSON.stringify(owner));
 }
 
@@ -73,12 +104,7 @@ export async function writeIsolationOwner(baseDir: string, id: string): Promise<
  * Whether a live omp process still owns the sandbox at `baseDir`.
  *
  * A missing or malformed marker means no verifiable owner — a crashed run or a
- * sandbox from before markers existed, both safe to reclaim. `process.kill(pid,
- * 0)` can fail with `EPERM` even when the process is alive, so only an explicit
- * `ESRCH` ("no such process") counts as dead; any other error is treated as
- * alive to avoid deleting a sandbox that is actually in use. When the marker
- * carries a {@link IsolationOwner.startToken}, a live pid whose current token no
- * longer matches is a recycled pid — a different process — and counts as dead.
+ * sandbox from before markers existed, both safe to reclaim.
  */
 export async function hasLiveIsolationOwner(baseDir: string): Promise<boolean> {
 	let decoded: unknown;
@@ -87,20 +113,5 @@ export async function hasLiveIsolationOwner(baseDir: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-	if (typeof decoded !== "object" || decoded === null || !("pid" in decoded)) return false;
-	const pid = decoded.pid;
-	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
-	}
-	// The pid is live (or unknowable via EPERM). Reject a recycled pid: if the
-	// marker pinned the owner's start-time token, the process wearing that pid
-	// now must still present the same token.
-	if ("startToken" in decoded && typeof decoded.startToken === "string" && decoded.startToken.length > 0) {
-		const current = await processStartToken(pid);
-		if (current !== null && current !== decoded.startToken) return false;
-	}
-	return true;
+	return isProcessOwnerLive(decoded);
 }

@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, MessageAttribution, ServiceTierByFamily, TextContent } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
 import type { CompactionMethod } from "./compaction-methods";
+import type { WorktreeIsolation } from "./worktree-isolation";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -39,6 +40,8 @@ export interface SessionHeader {
 	 * See {@link SessionWorkspace} in `./session-workspace`.
 	 */
 	additionalDirectories?: string[];
+	/** Verified linked-worktree identity and primary-checkout isolation boundary. */
+	worktreeIsolation?: WorktreeIsolation;
 	parentSession?: string;
 	/** Prior absolute JSONL locations recorded by successful session moves. */
 	previousSessionFiles?: string[];
@@ -54,6 +57,8 @@ export interface NewSessionOptions {
 	drop?: boolean;
 	/** Additional workspace directories to seed on the new session. */
 	additionalDirectories?: string[];
+	/** Linked-worktree isolation to retain in the new session. */
+	worktreeIsolation?: WorktreeIsolation;
 }
 
 export interface SessionEntryBase {

@@ -127,6 +127,26 @@ export interface FetchOptions {
 	readonly timeoutMs?: number;
 }
 
+export interface LsFilesOptions {
+	readonly excludeFile?: string;
+	readonly excludeStandard?: boolean;
+	readonly ignored?: boolean;
+	readonly others?: boolean;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitVersion {
+	readonly major: number;
+	readonly minor: number;
+	readonly patch: number;
+}
+
+export type LsIgnoredOptions = Omit<LsFilesOptions, "ignored" | "others"> &
+	(
+		| { readonly excludeStandard: true; readonly excludeFile?: string }
+		| { readonly excludeFile: string; readonly excludeStandard?: boolean }
+	);
+
 export interface CloneOptions {
 	readonly ref?: string;
 	readonly sha?: string;
@@ -157,6 +177,8 @@ export interface GitWorktreeEntry {
 	branch?: string;
 	detached: boolean;
 	head?: string;
+	/** Present when git has locked the worktree; empty string means no reason was recorded. */
+	locked?: string;
 	path: string;
 }
 
@@ -593,6 +615,47 @@ async function tryText(
 	if (result.exitCode !== 0) return undefined;
 	return result.stdout;
 }
+let gitVersionPromise: Promise<GitVersion | null> | null = null;
+
+export function parseGitVersion(stdout: string): GitVersion | null {
+	const match = stdout.match(/git version (\d+)\.(\d+)(?:\.(\d+))?/);
+	if (!match) return null;
+	return {
+		major: Number.parseInt(match[1], 10),
+		minor: Number.parseInt(match[2], 10),
+		patch: match[3] ? Number.parseInt(match[3], 10) : 0,
+	};
+}
+
+export async function getGitVersion(signal?: AbortSignal): Promise<GitVersion | null> {
+	if (!gitVersionPromise) {
+		gitVersionPromise = (async () => {
+			try {
+				const result = await git(process.cwd(), ["--version"], { readOnly: true, signal });
+				if (result.exitCode !== 0) return null;
+				return parseGitVersion(result.stdout);
+			} catch {
+				return null;
+			}
+		})();
+	}
+	return gitVersionPromise;
+}
+
+export function isGitVersionAtLeast(version: GitVersion | null, major: number, minor: number, patch = 0): boolean {
+	if (!version) return false;
+	if (version.major !== major) return version.major > major;
+	if (version.minor !== minor) return version.minor > minor;
+	return version.patch >= patch;
+}
+
+export function _setGitVersionForTesting(version: GitVersion | null): void {
+	gitVersionPromise = Promise.resolve(version);
+}
+
+export function _resetGitVersionForTesting(): void {
+	gitVersionPromise = null;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Internal: per-repo write serialization
@@ -618,7 +681,8 @@ const repoWriteChain = new Map<string, Promise<unknown>>();
  * module never auto-acquire — callers wrap the critical section themselves.
  */
 export async function withRepoLock<T>(cwd: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-	const key = (await repo.primaryRoot(cwd, signal)) ?? cwd;
+	const primaryRoot = (await repo.primaryRoot(cwd, signal)) ?? cwd;
+	const key = await fs.promises.realpath(primaryRoot).catch(() => path.resolve(primaryRoot));
 	const prior = repoWriteChain.get(key);
 	const run = (async () => {
 		if (prior) {
@@ -1152,33 +1216,94 @@ function parseDefaultBranchRef(refPath: string, target: string | null): string |
 	if (!target?.startsWith(HEAD_REF_PREFIX)) return null;
 	const resolvedRef = target.slice(HEAD_REF_PREFIX.length).trim();
 	const remotePrefix = refPath.slice(0, -"HEAD".length);
-	if (!resolvedRef.startsWith(remotePrefix)) return null;
-	return resolvedRef.slice(remotePrefix.length) || null;
+	if (!resolvedRef.startsWith(remotePrefix) || resolvedRef.length === remotePrefix.length) return null;
+	return resolvedRef;
 }
 
 function stripRemotePrefix(refValue: string): string | null {
-	const slash = refValue.indexOf("/");
-	if (slash < 0) return refValue || null;
-	return refValue.slice(slash + 1) || null;
+	if (!refValue.startsWith("refs/remotes/")) return null;
+	const remoteRef = refValue.slice("refs/remotes/".length);
+	const slash = remoteRef.indexOf("/");
+	if (slash < 0) return null;
+	return remoteRef.slice(slash + 1) || null;
 }
 
-function parseWorktreeList(text: string): GitWorktreeEntry[] {
-	const trimmed = text.trim();
-	if (!trimmed) return [];
-	return trimmed
-		.split(/\n\s*\n/)
-		.map(block => block.trim())
-		.filter(Boolean)
-		.map(block => {
-			const entry: GitWorktreeEntry = { detached: false, path: "" };
-			for (const line of block.split("\n")) {
-				if (line.startsWith("worktree ")) entry.path = line.slice("worktree ".length);
-				else if (line.startsWith("HEAD ")) entry.head = line.slice("HEAD ".length);
-				else if (line.startsWith("branch ")) entry.branch = line.slice("branch ".length);
-				else if (line === "detached") entry.detached = true;
+export function dequoteGitPath(raw: string): string {
+	if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2) return raw;
+	const inner = raw.slice(1, -1);
+	return inner.replace(/\\([0-7]{1,3}|[\\abfnrtv"])/g, (_, esc) => {
+		if (esc === "\\" || esc === '"') return esc;
+		if (esc === "n") return "\n";
+		if (esc === "t") return "\t";
+		if (esc === "r") return "\r";
+		if (esc === "b") return "\b";
+		if (esc === "f") return "\f";
+		if (esc === "a") return "\x07";
+		if (esc === "v") return "\x0b";
+		const octalCode = Number.parseInt(esc, 8);
+		return String.fromCharCode(octalCode);
+	});
+}
+
+export function parseWorktreeListZ(text: string): GitWorktreeEntry[] {
+	const entries: GitWorktreeEntry[] = [];
+	let entry: GitWorktreeEntry | null = null;
+	const finishEntry = (): void => {
+		if (entry) entries.push(entry);
+		entry = null;
+	};
+
+	for (const field of text.split("\0")) {
+		if (!field) {
+			finishEntry();
+		} else if (field.startsWith("worktree ")) {
+			finishEntry();
+			entry = { detached: false, path: field.slice("worktree ".length) };
+		} else if (entry) {
+			if (field.startsWith("HEAD ")) entry.head = field.slice("HEAD ".length);
+			else if (field.startsWith("branch ")) entry.branch = field.slice("branch ".length);
+			else if (field === "detached") entry.detached = true;
+			else if (field === "locked") entry.locked = "";
+			else if (field.startsWith("locked ")) entry.locked = field.slice("locked ".length);
+		}
+	}
+	finishEntry();
+	return entries;
+}
+
+export function parseWorktreeListNewline(text: string): GitWorktreeEntry[] {
+	const entries: GitWorktreeEntry[] = [];
+	let entry: GitWorktreeEntry | null = null;
+	const finishEntry = (): void => {
+		if (entry) entries.push(entry);
+		entry = null;
+	};
+
+	const lines = text.split(/\r?\n/);
+	for (const line of lines) {
+		const trimmed = line.trimEnd();
+		if (!trimmed) {
+			finishEntry();
+		} else if (trimmed.startsWith("worktree ")) {
+			finishEntry();
+			const rawPath = trimmed.slice("worktree ".length);
+			entry = { detached: false, path: dequoteGitPath(rawPath) };
+		} else if (entry) {
+			if (trimmed.startsWith("HEAD ")) {
+				entry.head = trimmed.slice("HEAD ".length);
+			} else if (trimmed.startsWith("branch ")) {
+				entry.branch = trimmed.slice("branch ".length);
+			} else if (trimmed === "detached") {
+				entry.detached = true;
+			} else if (trimmed === "locked") {
+				entry.locked = "";
+			} else if (trimmed.startsWith("locked ")) {
+				entry.locked = trimmed.slice("locked ".length);
 			}
-			return entry;
-		});
+		}
+	}
+	finishEntry();
+	return entries;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1793,28 +1918,40 @@ export const branch = {
 		return result.stdout.trim() || null;
 	},
 
-	/** Default branch name (from remote HEAD refs). */
-	async default(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	/** Exact cached remote default ref, preserving origin/upstream identity. */
+	async defaultRef(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const repository = await resolveRepository(cwd);
 		if (repository) {
 			for (const refPath of DEFAULT_BRANCH_REFS) {
-				const target = await readRef(repository, refPath, signal);
-				const branchName = parseDefaultBranchRef(refPath, target);
-				if (branchName) return branchName;
+				const defaultRef = parseDefaultBranchRef(refPath, await readRef(repository, refPath, signal));
+				if (defaultRef) return defaultRef;
 			}
 		}
-		for (const remoteRef of ["origin/HEAD", "upstream/HEAD"]) {
-			const result = await git(cwd, ["rev-parse", "--abbrev-ref", remoteRef], { readOnly: true, signal });
+		for (const refPath of DEFAULT_BRANCH_REFS) {
+			const remoteRef = refPath.slice("refs/remotes/".length);
+			const result = await git(cwd, ["rev-parse", "--symbolic-full-name", remoteRef], { readOnly: true, signal });
 			if (result.exitCode !== 0) continue;
-			const branchName = stripRemotePrefix(result.stdout.trim());
-			if (branchName) return branchName;
+			const defaultRef = parseDefaultBranchRef(refPath, `${HEAD_REF_PREFIX} ${result.stdout}`);
+			if (defaultRef) return defaultRef;
 		}
 		return null;
+	},
+
+	/** Default branch name (from remote HEAD refs). */
+	async default(cwd: string, signal?: AbortSignal): Promise<string | null> {
+		const defaultRef = await branch.defaultRef(cwd, signal);
+		return defaultRef ? stripRemotePrefix(defaultRef) : null;
 	},
 
 	/** Create a new branch at the given start point. */
 	async create(cwd: string, name: string, startPoint = "HEAD", signal?: AbortSignal): Promise<void> {
 		await runEffect(cwd, ["branch", name, startPoint], { signal });
+	},
+
+	/** Whether `name` is accepted by git as a local branch name. */
+	async isValidName(cwd: string, name: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["check-ref-format", "--branch", name], { readOnly: true, signal });
+		return result.exitCode === 0;
 	},
 
 	/** Force-move a branch to a new start point. */
@@ -1911,6 +2048,12 @@ export const ref = {
 		return result.stdout.trim() || null;
 	},
 
+	/** Atomically delete a ref only while it still points at `expectedOid`. */
+	async tryDelete(cwd: string, refName: string, expectedOid: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["update-ref", "-d", refName, expectedOid], { signal });
+		return result.exitCode === 0;
+	},
+
 	/** Tags pointing at a ref. */
 	async tags(cwd: string, refName = "HEAD", signal?: AbortSignal): Promise<string[]> {
 		return splitLines(
@@ -1927,6 +2070,31 @@ export const ref = {
 				{ readOnly: true, signal },
 			),
 		);
+	},
+
+	/**
+	 * Check whether any ref contains `oid`, optionally ignoring `excludeRef`.
+	 *
+	 * Uses `git for-each-ref --contains <oid>` (supported in git >= 2.7).
+	 * Returns true if at least one ref other than `options.excludeRef` contains the commit.
+	 */
+	async containsCommit(
+		cwd: string,
+		oid: string,
+		options: { excludeRef?: string; signal?: AbortSignal } = {},
+	): Promise<boolean> {
+		const result = await git(cwd, ["for-each-ref", `--contains=${oid}`, "--format=%(refname)"], {
+			readOnly: true,
+			signal: options.signal,
+		});
+		if (result.exitCode !== 0) return false;
+		const lines = splitLines(result.stdout);
+		for (const refName of lines) {
+			if (options.excludeRef === undefined || refName !== options.excludeRef) {
+				return true;
+			}
+		}
+		return false;
 	},
 };
 
@@ -1961,12 +2129,22 @@ export const worktree = {
 		cwd: string,
 		worktreePath: string,
 		refName: string,
-		options: { detach?: boolean; signal?: AbortSignal } = {},
+		options: { detach?: boolean; lockReason?: string; signal?: AbortSignal } = {},
 	): Promise<void> {
+		const version = await getGitVersion(options.signal);
+		const modern = isGitVersionAtLeast(version, 2, 36);
 		const args = ["worktree", "add"];
 		if (options.detach) args.push("--detach");
+		if (options.lockReason !== undefined && modern) {
+			args.push("--lock", "--reason", options.lockReason);
+		}
 		args.push(worktreePath, refName);
 		await runEffect(cwd, args, { signal: options.signal });
+		if (options.lockReason !== undefined && !modern) {
+			await runEffect(cwd, ["worktree", "lock", "--reason", options.lockReason, worktreePath], {
+				signal: options.signal,
+			});
+		}
 	},
 
 	async remove(
@@ -1993,7 +2171,24 @@ export const worktree = {
 	},
 
 	async list(cwd: string, signal?: AbortSignal): Promise<GitWorktreeEntry[]> {
-		return parseWorktreeList(await runText(cwd, ["worktree", "list", "--porcelain"], { readOnly: true, signal }));
+		const version = await getGitVersion(signal);
+		if (isGitVersionAtLeast(version, 2, 36)) {
+			return parseWorktreeListZ(
+				await runText(cwd, ["worktree", "list", "--porcelain", "-z"], { readOnly: true, signal }),
+			);
+		}
+		return parseWorktreeListNewline(
+			await runText(cwd, ["worktree", "list", "--porcelain"], { readOnly: true, signal }),
+		);
+	},
+
+	async lock(cwd: string, worktreePath: string, reason: string, signal?: AbortSignal): Promise<void> {
+		await runEffect(cwd, ["worktree", "lock", "--reason", reason, worktreePath], { signal });
+	},
+
+	async tryUnlock(cwd: string, worktreePath: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await git(cwd, ["worktree", "unlock", worktreePath], { signal });
+		return result.exitCode === 0;
 	},
 
 	async prune(cwd: string, signal?: AbortSignal): Promise<void> {
@@ -2266,20 +2461,25 @@ export async function clean(
 // ════════════════════════════════════════════════════════════════════════════
 
 export const ls = {
-	/** List files tracked or untracked by git. */
-	async files(
-		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
-	): Promise<string[]> {
-		const args = ["ls-files"];
+	/** List files tracked or untracked by git. Paths are returned unquoted thanks to `-z` so unusual filenames remain intact. */
+	async files(cwd: string, options: LsFilesOptions = {}): Promise<string[]> {
+		const args = ["ls-files", "-z"];
 		if (options.others) args.push("--others");
+		if (options.ignored) args.push("--ignored");
 		if (options.excludeStandard) args.push("--exclude-standard");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		if (options.excludeFile) args.push(`--exclude-from=${options.excludeFile}`);
+		const raw = await runText(cwd, args, { readOnly: true, signal: options.signal });
+		return raw.split("\0").filter(entry => entry.length > 0);
 	},
 
 	/** List untracked files (excludes ignored). */
 	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
 		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	},
+
+	/** List untracked paths selected by git's ignore matcher. */
+	async ignored(cwd: string, options: LsIgnoredOptions): Promise<string[]> {
+		return ls.files(cwd, { ...options, ignored: true, others: true });
 	},
 
 	/** List paths present in a ref, optionally filtered to specific paths. */
@@ -2430,6 +2630,23 @@ export const repo = {
 	/** Full GitRepository metadata. */
 	resolve(cwd: string): Promise<GitRepository | null> {
 		return resolveRepository(cwd);
+	},
+
+	/** Verify that a linked worktree's admin directory points back to its own `.git` file. */
+	async hasValidLinkedWorktreeBacklink(repository: GitRepository, signal?: AbortSignal): Promise<boolean> {
+		throwIfAborted(signal);
+		if (!(await isLinkedWorktreeAsync(repository))) return false;
+		throwIfAborted(signal);
+		const backlink = (await readOptionalText(path.join(repository.gitDir, "gitdir")))?.trim();
+		if (!backlink) return false;
+		throwIfAborted(signal);
+		const backlinkPath = path.resolve(repository.gitDir, backlink);
+		const [canonicalBacklink, canonicalGitEntry] = await Promise.all([
+			fs.promises.realpath(backlinkPath).catch(() => null),
+			fs.promises.realpath(repository.gitEntryPath).catch(() => null),
+		]);
+		throwIfAborted(signal);
+		return canonicalBacklink !== null && canonicalBacklink === canonicalGitEntry;
 	},
 
 	/** Check if the repository uses the reftable reference storage format (sync). */
